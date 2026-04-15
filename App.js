@@ -1,49 +1,56 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Animated, Easing, Alert } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Animated, Easing, Alert, ActivityIndicator, Platform } from 'react-native';
 import * as Location from 'expo-location';
-import { signInAnonymously } from 'firebase/auth';
+import { onAuthStateChanged } from 'firebase/auth';
 import { ref, set, onValue } from 'firebase/database';
 import { auth, database } from './src/firebaseConfig';
-import { MapPin, Flame, Activity, ShieldAlert, Wifi, WifiOff } from 'lucide-react-native';
+import { MapPin, Flame, Activity as ActivitySquare, ShieldAlert, Wifi, WifiOff } from 'lucide-react-native';
+import AuthScreen from './src/AuthScreen';
 
 export default function App() {
-  const [uid, setUid] = useState(null);
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
   const [location, setLocation] = useState(null);
   const [gpsLocked, setGpsLocked] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [activeSOSId, setActiveSOSId] = useState(null);
   const [status, setStatus] = useState(null); // 'searching', 'routed', 'responding'
 
-  const glowAnim = useRef(new Animated.Value(parseFloat(1))).current;
-  const expandAnim = useRef(new Animated.Value(parseFloat(0))).current;
+  const glowAnim = useRef(new Animated.Value(1)).current;
+  const expandAnim = useRef(new Animated.Value(0)).current;
 
+  // 1. Listen for Auth State Changes
   useEffect(() => {
-    // 1. Auth on Launch
-    const login = async () => {
-      try {
-        const userCred = await signInAnonymously(auth);
-        setUid(userCred.user.uid);
-      } catch (error) {
-        console.warn("Auth failed - likely using placeholders. Using dummy UID.", error.message);
-        setUid("anon_" + Math.random().toString(36).substring(7));
-      }
-    };
-    login();
+    const unsubscribe = onAuthStateChanged(auth, (authUser) => {
+      setUser(authUser);
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
 
-    // 2. Fetch Location
+  // 2. Fetch Location when user is authenticated
+  useEffect(() => {
+    if (!user) return;
+
     const getPermissions = async () => {
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission to access location was denied');
-        return;
+      try {
+        let { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          Alert.alert('Permission to access location was denied');
+          return;
+        }
+        let loc = await Location.getCurrentPositionAsync({});
+        setLocation(loc.coords);
+        setGpsLocked(true);
+      } catch (error) {
+        console.warn("Location error:", error.message);
       }
-      let loc = await Location.getCurrentPositionAsync({});
-      setLocation(loc.coords);
-      setGpsLocked(true);
     };
     getPermissions();
+  }, [user]);
 
-    // 3. Button Pulse Animation
+  // 3. Button Pulse Animation
+  useEffect(() => {
     Animated.loop(
       Animated.sequence([
         Animated.timing(glowAnim, {
@@ -63,7 +70,7 @@ export default function App() {
   }, []);
 
   const handleMainButtonPress = () => {
-    if (activeSOSId) return; // Disallow pressing if already active
+    if (activeSOSId) return;
     
     const nextExpanded = !isExpanded;
     setIsExpanded(nextExpanded);
@@ -76,9 +83,8 @@ export default function App() {
   };
 
   const sendSOS = async (type) => {
-    if (!uid) return;
+    if (!user) return;
     
-    // Generate timestamp
     const timestamp = Date.now();
     const lat = location ? location.latitude : 0;
     const lng = location ? location.longitude : 0;
@@ -89,19 +95,19 @@ export default function App() {
       lng,
       status: "searching",
       message: "",
-      timestamp
+      timestamp,
+      uid: user.uid
     };
 
     try {
-      const dbRefPath = `sos/${uid}/${timestamp}`;
+      const dbRefPath = `sos/${user.uid}/${timestamp}`;
       const sosRef = ref(database, dbRefPath);
       await set(sosRef, payload);
       
       setActiveSOSId(dbRefPath);
       setStatus("searching");
-      setIsExpanded(false); // Collapse options
+      setIsExpanded(false);
 
-      // Attach listener for real-time status updates
       onValue(sosRef, (snapshot) => {
         const data = snapshot.val();
         if (data && data.status) {
@@ -110,12 +116,10 @@ export default function App() {
       });
     } catch (e) {
       console.warn("DB writes failed - placeholder or offline mode active.", e.message);
-      // Fallback UI Simulation for Demonstration
       setActiveSOSId(`dummy_path`);
       setStatus("searching");
       setIsExpanded(false);
       
-      // Simulate backend routing updates for the Tracker
       setTimeout(() => setStatus("routed"), 3000);
       setTimeout(() => setStatus("responding"), 7000);
       setTimeout(() => {
@@ -126,13 +130,25 @@ export default function App() {
     }
   };
 
+  if (loading) {
+    return (
+      <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
+        <ActivityIndicator size="large" color="#dc2626" />
+      </View>
+    );
+  }
+
+  if (!user) {
+    return <AuthScreen onAuthSuccess={(u) => setUser(u)} onSkipAuth={() => {}} />;
+  }
+
   const optionsTranslateY = expandAnim.interpolate({
     inputRange: [0, 1],
-    outputRange: [50, 0] // slide up into view
+    outputRange: [50, 0]
   });
   const optionsOpacity = expandAnim.interpolate({
     inputRange: [0, 1],
-    outputRange: [0, 1] // fade in
+    outputRange: [0, 1]
   });
 
   return (
@@ -142,7 +158,7 @@ export default function App() {
         <View>
           <Text style={styles.title}>SOS</Text>
           <Text style={styles.subtitle}>EMERGENCY RESPONSE</Text>
-          {uid && <Text style={styles.uid}>UID: {uid}</Text>}
+          <Text style={styles.uid}>UID: {user.uid.substring(0, 12)}...</Text>
         </View>
         <View style={styles.gpsContainer}>
           <MapPin color={gpsLocked ? "#0f0" : "#555"} size={14} />
@@ -155,11 +171,9 @@ export default function App() {
 
       {/* Main Content Area */}
       <View style={styles.centerArea}>
-        {/* Glow rings */}
         <Animated.View style={[styles.glowRing1, { transform: [{ scale: glowAnim }] }]} />
         <Animated.View style={[styles.glowRing2, { transform: [{ scale: glowAnim }] }]} />
         
-        {/* Main SOS Button */}
         <TouchableOpacity 
           activeOpacity={0.85}
           onPress={handleMainButtonPress}
@@ -184,7 +198,7 @@ export default function App() {
             <Text style={styles.optionText}>FIRE</Text>
           </TouchableOpacity>
           <TouchableOpacity style={styles.optionButton} onPress={() => sendSOS('Medical')}>
-            <Activity color="#fff" size={28} />
+            <ActivitySquare color="#fff" size={28} />
             <Text style={styles.optionText}>MEDICAL</Text>
           </TouchableOpacity>
           <TouchableOpacity style={styles.optionButton} onPress={() => sendSOS('Security')}>
@@ -263,7 +277,7 @@ const styles = StyleSheet.create({
     color: '#333',
     fontSize: 10,
     marginTop: 20,
-    fontFamily: 'Courier',
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
     letterSpacing: 1
   },
   gpsContainer: {
@@ -421,3 +435,4 @@ const styles = StyleSheet.create({
     zIndex: 1,
   }
 });
+
