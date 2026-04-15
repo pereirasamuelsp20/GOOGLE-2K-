@@ -18,12 +18,16 @@ export const Colors = {
     tabIconSelected: tintColorLight,
   },
   dark: {
-    text: '#ECEDEE',
-    background: '#151718',
-    tint: tintColorDark,
-    icon: '#9BA1A6',
-    tabIconDefault: '#9BA1A6',
-    tabIconSelected: tintColorDark,
+    text: '#FFFFFF',
+    background: '#000000', // Solid Black
+    tint: '#C8102E', // Safety Red
+    icon: '#FFFFFF',
+    tabIconDefault: '#475569',
+    tabIconSelected: '#C8102E',
+    card: '#FFFFFF',
+    border: '#E5E7EB',
+    error: '#C8102E',
+    success: '#0056D2', // Safety Blue for "Safe"
   },
 };
 
