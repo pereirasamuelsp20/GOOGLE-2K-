@@ -2,10 +2,15 @@ import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Animated, Easing, Alert, ActivityIndicator, Platform } from 'react-native';
 import * as Location from 'expo-location';
 import { onAuthStateChanged } from 'firebase/auth';
-import { ref, set, onValue } from 'firebase/database';
-import { auth, database } from './src/firebaseConfig';
-import { MapPin, Flame, Activity as ActivitySquare, ShieldAlert, Wifi, WifiOff } from 'lucide-react-native';
+import { doc, setDoc, onSnapshot } from 'firebase/firestore';
+import { auth, firestore } from './src/firebaseConfig';
+import { MapPin, Flame, Activity as ActivitySquare, ShieldAlert, Wifi, WifiOff, Menu, Map as MapIcon, User, X } from 'lucide-react-native';
 import AuthScreen from './src/AuthScreen';
+
+let WebMapComponent = null;
+if (Platform.OS === 'web') {
+  WebMapComponent = require('./src/WebMapComponent').default;
+}
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -15,6 +20,9 @@ export default function App() {
   const [isExpanded, setIsExpanded] = useState(false);
   const [activeSOSId, setActiveSOSId] = useState(null);
   const [status, setStatus] = useState(null); // 'searching', 'routed', 'responding'
+
+  const [currentScreen, setCurrentScreen] = useState('Home');
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
 
   const glowAnim = useRef(new Animated.Value(1)).current;
   const expandAnim = useRef(new Animated.Value(0)).current;
@@ -57,13 +65,13 @@ export default function App() {
           toValue: 1.15,
           duration: 1500,
           easing: Easing.inOut(Easing.ease),
-          useNativeDriver: true,
+          useNativeDriver: Platform.OS !== 'web',
         }),
         Animated.timing(glowAnim, {
           toValue: 1,
           duration: 1500,
           easing: Easing.inOut(Easing.ease),
-          useNativeDriver: true,
+          useNativeDriver: Platform.OS !== 'web',
         }),
       ])
     ).start();
@@ -77,7 +85,7 @@ export default function App() {
     Animated.timing(expandAnim, {
       toValue: nextExpanded ? 1 : 0,
       duration: 350,
-      useNativeDriver: true,
+      useNativeDriver: Platform.OS !== 'web',
       easing: Easing.out(Easing.exp)
     }).start();
   };
@@ -100,16 +108,16 @@ export default function App() {
     };
 
     try {
-      const dbRefPath = `sos/${user.uid}/${timestamp}`;
-      const sosRef = ref(database, dbRefPath);
-      await set(sosRef, payload);
+      const sosId = timestamp.toString();
+      const sosRef = doc(firestore, 'sos', sosId);
+      await setDoc(sosRef, payload);
       
-      setActiveSOSId(dbRefPath);
+      setActiveSOSId(sosId);
       setStatus("searching");
       setIsExpanded(false);
 
-      onValue(sosRef, (snapshot) => {
-        const data = snapshot.val();
+      onSnapshot(sosRef, (snapshot) => {
+        const data = snapshot.data();
         if (data && data.status) {
           setStatus(data.status);
         }
@@ -130,6 +138,29 @@ export default function App() {
     }
   };
 
+  const cancelSOS = () => {
+    Alert.alert(
+      "Cancel Emergency Request?",
+      "Are you sure you want to cancel the SOS request? This action cannot be undone.",
+      [
+        { text: "No, keep active", style: "cancel" },
+        { 
+          text: "Yes, Cancel", 
+          style: "destructive", 
+          onPress: async () => {
+             if (activeSOSId !== 'dummy_path') {
+               try {
+                 await setDoc(doc(firestore, 'sos', activeSOSId), { status: 'cancelled' }, { merge: true });
+               } catch (e) { console.log(e); }
+             }
+             setActiveSOSId(null);
+             setStatus(null);
+          } 
+        }
+      ]
+    );
+  };
+
   if (loading) {
     return (
       <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
@@ -139,7 +170,15 @@ export default function App() {
   }
 
   if (!user) {
-    return <AuthScreen onAuthSuccess={(u) => setUser(u)} onSkipAuth={() => {}} />;
+    return <AuthScreen 
+      onAuthSuccess={(u, isNew) => {
+        setUser(u);
+        if (isNew) {
+          setTimeout(() => Alert.alert("Welcome to ReliefMesh!", "We're glad you joined the network."), 500);
+        }
+      }} 
+      onSkipAuth={() => setUser({ uid: 'sys_anonymous', isAnonymous: true })} 
+    />;
   }
 
   const optionsTranslateY = expandAnim.interpolate({
@@ -154,11 +193,16 @@ export default function App() {
   return (
     <View style={styles.container}>
       {/* Header */}
-      <View style={styles.headerContainer}>
-        <View>
-          <Text style={styles.title}>SOS</Text>
-          <Text style={styles.subtitle}>EMERGENCY RESPONSE</Text>
-          <Text style={styles.uid}>UID: {user.uid.substring(0, 12)}...</Text>
+      <View style={{ ...styles.headerContainer, zIndex: 10 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+          <TouchableOpacity onPress={() => setIsMenuOpen(true)}>
+            <Menu color="#fff" size={28} />
+          </TouchableOpacity>
+          <View>
+            <Text style={styles.title}>SOS</Text>
+            <Text style={styles.subtitle}>EMERGENCY RESPONSE</Text>
+            <Text style={styles.uid}>UID: {user.uid.substring(0, 12)}...</Text>
+          </View>
         </View>
         <View style={styles.gpsContainer}>
           <MapPin color={gpsLocked ? "#0f0" : "#555"} size={14} />
@@ -170,60 +214,137 @@ export default function App() {
       </View>
 
       {/* Main Content Area */}
-      <View style={styles.centerArea}>
-        <Animated.View style={[styles.glowRing1, { transform: [{ scale: glowAnim }] }]} />
-        <Animated.View style={[styles.glowRing2, { transform: [{ scale: glowAnim }] }]} />
-        
-        <TouchableOpacity 
-          activeOpacity={0.85}
-          onPress={handleMainButtonPress}
-          style={[styles.mainButton, activeSOSId && styles.mainButtonActive]}
-          disabled={!!activeSOSId} 
-        >
-          <Text style={[styles.mainButtonText, activeSOSId && styles.mainButtonTextActive]}>
-            SOS
-          </Text>
-        </TouchableOpacity>
-      </View>
+      {currentScreen === 'Home' && (
+        <>
+          <View style={styles.centerArea}>
+            <Animated.View style={[styles.glowRing1, { transform: [{ scale: glowAnim }] }]} />
+            <Animated.View style={[styles.glowRing2, { transform: [{ scale: glowAnim }] }]} />
+            
+            <TouchableOpacity 
+              activeOpacity={0.85}
+              onPress={handleMainButtonPress}
+              style={[styles.mainButton, activeSOSId && styles.mainButtonActive]}
+              disabled={!!activeSOSId} 
+            >
+              <Text style={[styles.mainButtonText, activeSOSId && styles.mainButtonTextActive]}>
+                SOS
+              </Text>
+            </TouchableOpacity>
+          </View>
 
-      {/* Expanded Emergency Options */}
-      {(!activeSOSId) && (
-        <Animated.View style={[styles.optionsContainer, { 
-          opacity: optionsOpacity, 
-          transform: [{ translateY: optionsTranslateY }],
-          pointerEvents: isExpanded ? 'auto' : 'none'
-        }]}>
-          <TouchableOpacity style={styles.optionButton} onPress={() => sendSOS('Fire')}>
-            <Flame color="#fff" size={28} />
-            <Text style={styles.optionText}>FIRE</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.optionButton} onPress={() => sendSOS('Medical')}>
-            <ActivitySquare color="#fff" size={28} />
-            <Text style={styles.optionText}>MEDICAL</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.optionButton} onPress={() => sendSOS('Security')}>
-            <ShieldAlert color="#fff" size={28} />
-            <Text style={styles.optionText}>SECURITY</Text>
-          </TouchableOpacity>
-        </Animated.View>
+          {/* Expanded Emergency Options */}
+          {(!activeSOSId) && (
+            <Animated.View 
+              {...Platform.select({ web: {}, default: { pointerEvents: isExpanded ? 'auto' : 'none' } })}
+              style={[styles.optionsContainer, { 
+                opacity: optionsOpacity, 
+                transform: [{ translateY: optionsTranslateY }],
+                ...(Platform.OS === 'web' ? { pointerEvents: isExpanded ? 'auto' : 'none' } : {})
+              }]}
+            >
+              <TouchableOpacity style={styles.optionButton} onPress={() => sendSOS('Fire')}>
+                <Flame color="#fff" size={28} />
+                <Text style={styles.optionText}>FIRE</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.optionButton} onPress={() => sendSOS('Medical')}>
+                <ActivitySquare color="#fff" size={28} />
+                <Text style={styles.optionText}>MEDICAL</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.optionButton} onPress={() => sendSOS('Security')}>
+                <ShieldAlert color="#fff" size={28} />
+                <Text style={styles.optionText}>SECURITY</Text>
+              </TouchableOpacity>
+            </Animated.View>
+          )}
+
+          {!activeSOSId && (
+            <Text style={styles.tapPrompt}>
+              {isExpanded ? "SELECT EMERGENCY TYPE" : "TAP TO ACTIVATE"}
+            </Text>
+          )}
+
+          {/* Live Tracker when Triggered */}
+          {activeSOSId && (
+            <View style={styles.trackerContainer}>
+              <Text style={styles.trackerTitle}>EMERGENCY PROTOCOL ACTIVE</Text>
+              <View style={styles.stepsContainer}>
+                <Step indicator="Searching" currentStatus={status} />
+                <View style={styles.stepConnector} />
+                <Step indicator="Routed" currentStatus={status} />
+                <View style={styles.stepConnector} />
+                <Step indicator="Responding" currentStatus={status} />
+              </View>
+              <TouchableOpacity style={styles.cancelButton} onPress={cancelSOS}>
+                <Text style={styles.cancelButtonText}>CANCEL SOS</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </>
       )}
 
-      {!activeSOSId && (
-        <Text style={styles.tapPrompt}>
-          {isExpanded ? "SELECT EMERGENCY TYPE" : "TAP TO ACTIVATE"}
-        </Text>
+      {currentScreen === 'Map' && (
+        <View style={{ flex: 1, backgroundColor: '#0f0f0f' }}>
+          {Platform.OS === 'web' && WebMapComponent ? (
+            <WebMapComponent userLoc={location} />
+          ) : (
+            <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: 30 }}>
+              <Text style={{ color: '#fff', fontSize: 28, fontWeight: '700', marginBottom: 12 }}>Citizen Map</Text>
+              <Text style={{ color: '#888', textAlign: 'center', paddingHorizontal: 40 }}>
+                Live mesh map viewing requires the ReliefMesh Dashboard or running on Web.
+              </Text>
+            </View>
+          )}
+        </View>
       )}
 
-      {/* Live Tracker when Triggered */}
-      {activeSOSId && (
-        <View style={styles.trackerContainer}>
-          <Text style={styles.trackerTitle}>EMERGENCY PROTOCOL ACTIVE</Text>
-          <View style={styles.stepsContainer}>
-            <Step indicator="Searching" currentStatus={status} />
-            <View style={styles.stepConnector} />
-            <Step indicator="Routed" currentStatus={status} />
-            <View style={styles.stepConnector} />
-            <Step indicator="Responding" currentStatus={status} />
+      {currentScreen === 'Profile' && (
+        <View style={{ flex: 1, padding: 20, marginTop: 30 }}>
+          <Text style={{ color: '#fff', fontSize: 32, fontWeight: '900', letterSpacing: -1 }}>Profile</Text>
+          
+          <View style={{ marginTop: 30, backgroundColor: '#131313', padding: 20, borderRadius: 12, borderWidth: 1, borderColor: '#222' }}>
+             <Text style={{ color: '#888', fontSize: 12, fontWeight: '700', letterSpacing: 1.5, marginBottom: 8 }}>USER IDENTIFIER</Text>
+             <Text style={{ color: '#fff', fontSize: 16 }}>{user.uid}</Text>
+             
+             <Text style={{ color: '#888', fontSize: 12, fontWeight: '700', letterSpacing: 1.5, marginTop: 24, marginBottom: 8 }}>ACCOUNT TYPE</Text>
+             <Text style={{ color: '#fff', fontSize: 16 }}>{user.isAnonymous ? 'Anonymous Citizen' : 'Registered Member'}</Text>
+          </View>
+
+          <TouchableOpacity style={{ marginTop: 40, backgroundColor: 'rgba(255, 59, 48, 0.1)', borderWidth: 1, borderColor: 'rgba(255, 59, 48, 0.3)', padding: 16, borderRadius: 10, alignItems: 'center' }} onPress={() => auth.signOut()}>
+             <Text style={{ color: '#FF3B30', fontWeight: '800', letterSpacing: 1 }}>SIGN OUT securely</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Drawer Overlay */}
+      {isMenuOpen && (
+        <View style={[StyleSheet.absoluteFill, { zIndex: 999 }]}>
+          <TouchableOpacity 
+            style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.7)' }} 
+            activeOpacity={1} 
+            onPress={() => setIsMenuOpen(false)} 
+          />
+          <View style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: 280, backgroundColor: '#0f0f0f', borderRightWidth: 1, borderRightColor: '#222', padding: 24, paddingTop: 60 }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 40 }}>
+              <Text style={{ color: '#fff', fontSize: 24, fontWeight: '900' }}>ReliefMesh</Text>
+              <TouchableOpacity onPress={() => setIsMenuOpen(false)}>
+                <X color="#aaa" size={24} />
+              </TouchableOpacity>
+            </View>
+
+            <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Home'); setIsMenuOpen(false); }}>
+              <Flame color={currentScreen === 'Home' ? '#FF3B30' : '#888'} size={24} />
+              <Text style={{ color: currentScreen === 'Home' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>SOS Core</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Map'); setIsMenuOpen(false); }}>
+              <MapIcon color={currentScreen === 'Map' ? '#FF3B30' : '#888'} size={24} />
+              <Text style={{ color: currentScreen === 'Map' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Mesh Map</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Profile'); setIsMenuOpen(false); }}>
+              <User color={currentScreen === 'Profile' ? '#FF3B30' : '#888'} size={24} />
+              <Text style={{ color: currentScreen === 'Profile' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>My Profile</Text>
+            </TouchableOpacity>
           </View>
         </View>
       )}
@@ -322,17 +443,25 @@ const styles = StyleSheet.create({
     backgroundColor: '#FF3B30',
     justifyContent: 'center',
     alignItems: 'center',
-    shadowColor: '#FF3B30',
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.8,
-    shadowRadius: 25,
-    elevation: 10,
+    ...Platform.select({
+      web: { boxShadow: '0px 0px 25px rgba(255,59,48,0.8)' },
+      default: {
+        shadowColor: '#FF3B30',
+        shadowOffset: { width: 0, height: 0 },
+        shadowOpacity: 0.8,
+        shadowRadius: 25,
+        elevation: 10,
+      }
+    }),
   },
   mainButtonActive: {
     backgroundColor: '#3A0000',
-    shadowColor: 'transparent',
     borderWidth: 3,
     borderColor: '#7A0000',
+    ...Platform.select({
+      web: { boxShadow: 'none' },
+      default: { shadowColor: 'transparent' }
+    }),
   },
   mainButtonText: {
     color: '#FFF',
@@ -411,10 +540,16 @@ const styles = StyleSheet.create({
   stepDotActive: {
     backgroundColor: '#0f0',
     borderColor: '#0f0',
-    shadowColor: '#0f0',
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.8,
-    shadowRadius: 10,
+    ...Platform.select({
+      web: { boxShadow: '0px 0px 10px rgba(0,255,0,0.8)' },
+      default: {
+        shadowColor: '#0f0',
+        shadowOffset: { width: 0, height: 0 },
+        shadowOpacity: 0.8,
+        shadowRadius: 10,
+        elevation: 5,
+      }
+    }),
   },
   stepText: {
     color: '#444',
@@ -433,6 +568,22 @@ const styles = StyleSheet.create({
     marginHorizontal: -15,
     marginTop: -25, // center between dots minus text height
     zIndex: 1,
+  },
+  cancelButton: {
+    marginTop: 32,
+    alignSelf: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#4A0000',
+    backgroundColor: 'rgba(74, 0, 0, 0.3)',
+  },
+  cancelButtonText: {
+    color: '#ff4444',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 2,
   }
 });
 

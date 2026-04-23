@@ -183,11 +183,11 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
       setErrorMsg('');
       if (activeTab === 'Sign in') {
         const cred = await signInWithEmailAndPassword(auth, email, password);
-        onAuthSuccess(cred.user);
+        onAuthSuccess(cred.user, false);
       } else {
         const cred = await createUserWithEmailAndPassword(auth, email, password);
         // would save fullName and role to user profile or DB here
-        onAuthSuccess(cred.user);
+        onAuthSuccess(cred.user, true);
       }
     } catch (err) {
       setErrorMsg(err.message);
@@ -201,7 +201,7 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
       if (Platform.OS === 'web') {
         const provider = new GoogleAuthProvider();
         const cred = await signInWithPopup(auth, provider);
-        onAuthSuccess(cred.user);
+        onAuthSuccess(cred.user, true); // Assuming they are potentially new or we welcome anyway
       } else {
         // Dummy fallback for native in this demo
         setErrorMsg('Google Sign-in requires native configuration in this demo.');
@@ -266,7 +266,7 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
                 <Text style={styles.label}>Full name</Text>
                 <TextInput
                   style={styles.input}
-                  placeholder="John Doe"
+                  placeholder="Name Surname"
                   placeholderTextColor="#4a4a5a"
                   value={fullName}
                   onChangeText={setFullName}
@@ -278,7 +278,7 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
               <Text style={styles.label}>Email address</Text>
               <TextInput
                 style={styles.input}
-                placeholder="you@example.com"
+                placeholder="Your_Email@gmail.com"
                 placeholderTextColor="#4a4a5a"
                 keyboardType="email-address"
                 autoCapitalize="none"
