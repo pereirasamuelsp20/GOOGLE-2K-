@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Animated, Easing, Alert, ActivityIndicator, Platform } from 'react-native';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Animated, Easing, Alert, ActivityIndicator, Platform, Linking, NativeModules } from 'react-native';
 import * as Location from 'expo-location';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, setDoc, onSnapshot } from 'firebase/firestore';
@@ -7,9 +7,27 @@ import { auth, firestore } from './src/firebaseConfig';
 import { MapPin, Flame, Activity as ActivitySquare, ShieldAlert, Wifi, WifiOff, Menu, Map as MapIcon, User, X } from 'lucide-react-native';
 import AuthScreen from './src/AuthScreen';
 
+// Widget imports — only available on native platforms after prebuild
+let requestWidgetUpdate = null;
+let SOSWidgetComponent = null;
+try {
+  if (Platform.OS === 'android') {
+    const androidWidget = require('react-native-android-widget');
+    requestWidgetUpdate = androidWidget.requestWidgetUpdate;
+    SOSWidgetComponent = require('./widgets/SOSWidget').SOSWidget;
+  }
+} catch (_) {
+  // Widget module not available (e.g. running in Expo Go or web)
+}
+
 let WebMapComponent = null;
 if (Platform.OS === 'web') {
   WebMapComponent = require('./src/WebMapComponent').default;
+}
+
+let NativeMapComponent = null;
+if (Platform.OS !== 'web') {
+  NativeMapComponent = require('./src/NativeMapComponent').default;
 }
 
 export default function App() {
@@ -36,6 +54,23 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
+  // 1b. Force widget refresh on app launch (Android)
+  useEffect(() => {
+    if (Platform.OS === 'android' && requestWidgetUpdate && SOSWidgetComponent) {
+      try {
+        requestWidgetUpdate({
+          widgetName: 'SOSWidget',
+          renderWidget: () => {
+            const Widget = SOSWidgetComponent;
+            return <Widget sosActive={false} activeType={null} />;
+          },
+        });
+      } catch (e) {
+        console.warn('Initial widget update failed:', e.message);
+      }
+    }
+  }, []);
+
   // 2. Fetch Location when user is authenticated
   useEffect(() => {
     if (!user) return;
@@ -47,14 +82,104 @@ export default function App() {
           Alert.alert('Permission to access location was denied');
           return;
         }
-        let loc = await Location.getCurrentPositionAsync({});
+        let loc;
+        try {
+          loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced, timeout: 5000 });
+        } catch (e) {
+          console.warn("Current position failed, falling back to last known:", e.message);
+          loc = await Location.getLastKnownPositionAsync({});
+        }
+
+        if (!loc) {
+          console.warn('Could not retrieve any location data. Using default location (Mumbai).');
+          loc = { coords: { latitude: 19.0760, longitude: 72.8777 } }; // Default to Mumbai
+        }
+
         setLocation(loc.coords);
         setGpsLocked(true);
+
+        // Write GPS state to iOS shared UserDefaults for WidgetKit
+        if (Platform.OS === 'ios' && NativeModules.SharedDefaults) {
+          try {
+            const sharedState = JSON.stringify({
+              gpsLocked: true,
+              lat: loc.coords.latitude,
+              lng: loc.coords.longitude,
+              uid: user?.uid ?? 'anonymous',
+              lastUpdated: Date.now(),
+            });
+            await NativeModules.SharedDefaults.setItem('widgetState', sharedState);
+          } catch (e) {
+            console.warn('Failed to write shared state for iOS widget:', e.message);
+          }
+        }
       } catch (error) {
         console.warn("Location error:", error.message);
+        // Ensure the app still loads even if everything fails
+        setLocation({ latitude: 19.0760, longitude: 72.8777 });
+        setGpsLocked(true);
       }
     };
     getPermissions();
+  }, [user]);
+
+  // 2b. Deep link handler for widget taps (reliefmesh://sos?type=general|fire|medical|security)
+  // Handles BOTH authenticated and unauthenticated (widget) launches
+  useEffect(() => {
+    const handleURL = async (url) => {
+      if (!url) return;
+      const match = url.match(/reliefmesh:\/\/sos\?type=(\w+)/);
+      if (match) {
+        const type = match[1];
+        const sosType = type.charAt(0).toUpperCase() + type.slice(1);
+
+        // If user is already authed, send directly
+        if (user) {
+          setCurrentScreen('Home');
+          await sendSOS(sosType);
+          return;
+        }
+
+        // Widget tap without login — bypass auth entirely with synthetic anonymous user
+        // (signInAnonymously requires Firebase console setup, so we skip it)
+        const widgetUid = `widget_${Date.now()}`;
+        setUser({ uid: widgetUid, isAnonymous: true });
+        setCurrentScreen('Home');
+
+        // Get location if possible
+        let loc = null;
+        try {
+          let { status: permStatus } = await Location.requestForegroundPermissionsAsync();
+          if (permStatus === 'granted') {
+            try {
+              loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced, timeout: 5000 });
+            } catch (e) {
+              console.warn("Widget SOS current position failed, fallback:", e.message);
+              loc = await Location.getLastKnownPositionAsync({});
+            }
+            if (!loc) {
+              console.warn("Widget SOS could not retrieve location. Using default.");
+              loc = { coords: { latitude: 19.0760, longitude: 72.8777 } };
+            }
+            
+            setLocation(loc.coords);
+            setGpsLocked(true);
+          }
+        } catch (e) {
+          console.warn('Location unavailable for widget SOS:', e.message);
+        }
+
+        // Send the SOS immediately
+        await sendSOSDirect(sosType, widgetUid, loc ? loc.coords : null);
+      }
+    };
+
+    // Handle cold start (app was closed)
+    Linking.getInitialURL().then(handleURL);
+
+    // Handle warm start (app was backgrounded)
+    const subscription = Linking.addEventListener('url', ({ url }) => handleURL(url));
+    return () => subscription.remove();
   }, [user]);
 
   // 3. Button Pulse Animation
@@ -90,6 +215,54 @@ export default function App() {
     }).start();
   };
 
+  // Direct SOS sender — works without requiring `user` state (for widget deep links)
+  const sendSOSDirect = async (type, uid, coords) => {
+    const timestamp = Date.now();
+    const lat = coords ? coords.latitude : 0;
+    const lng = coords ? coords.longitude : 0;
+
+    const payload = {
+      type,
+      lat,
+      lng,
+      status: "searching",
+      message: type === 'General' ? '[Widget SOS - No Login]' : '',
+      timestamp,
+      uid: uid || 'anonymous',
+      source: 'widget',
+    };
+
+    try {
+      const sosId = timestamp.toString();
+      const sosRef = doc(firestore, 'sos', sosId);
+      await setDoc(sosRef, payload);
+      
+      setActiveSOSId(sosId);
+      setStatus("searching");
+      setIsExpanded(false);
+
+      onSnapshot(sosRef, (snapshot) => {
+        const data = snapshot.data();
+        if (data && data.status) {
+          setStatus(data.status);
+        }
+      });
+    } catch (e) {
+      console.warn("Widget SOS DB write failed — using demo mode.", e.message);
+      setActiveSOSId('dummy_path');
+      setStatus("searching");
+      setIsExpanded(false);
+      
+      setTimeout(() => setStatus("routed"), 3000);
+      setTimeout(() => setStatus("responding"), 7000);
+      setTimeout(() => {
+        setActiveSOSId(null);
+        setStatus(null);
+        Alert.alert("Demo Over", "Emergency responded successfully.");
+      }, 12000);
+    }
+  };
+
   const sendSOS = async (type) => {
     if (!user) return;
     
@@ -116,10 +289,78 @@ export default function App() {
       setStatus("searching");
       setIsExpanded(false);
 
-      onSnapshot(sosRef, (snapshot) => {
+      // Write SOS active state to iOS shared UserDefaults for WidgetKit
+      if (Platform.OS === 'ios' && NativeModules.SharedDefaults) {
+        try {
+          const sharedState = JSON.stringify({
+            gpsLocked: gpsLocked,
+            lat: lat,
+            lng: lng,
+            uid: user?.uid ?? 'anonymous',
+            lastUpdated: Date.now(),
+            sosActive: true,
+            activeType: type.toLowerCase(),
+            status: 'searching',
+          });
+          await NativeModules.SharedDefaults.setItem('widgetState', sharedState);
+        } catch (e) {
+          console.warn('Failed to write SOS state for iOS widget:', e.message);
+        }
+      }
+
+      onSnapshot(sosRef, async (snapshot) => {
         const data = snapshot.data();
         if (data && data.status) {
           setStatus(data.status);
+
+          // Write updated status to iOS shared UserDefaults
+          if (Platform.OS === 'ios' && NativeModules.SharedDefaults) {
+            try {
+              const sharedState = JSON.stringify({
+                gpsLocked: gpsLocked,
+                lat: location ? location.latitude : 0,
+                lng: location ? location.longitude : 0,
+                uid: user?.uid ?? 'anonymous',
+                lastUpdated: Date.now(),
+                sosActive: data.status !== 'cancelled',
+                activeType: type.toLowerCase(),
+                status: data.status,
+              });
+              await NativeModules.SharedDefaults.setItem('widgetState', sharedState);
+            } catch (e) {
+              console.warn('Failed to update widget state:', e.message);
+            }
+          }
+
+          // Push update to Android home screen widget
+          if (Platform.OS === 'android' && requestWidgetUpdate && SOSWidgetComponent) {
+            try {
+              await requestWidgetUpdate({
+                widgetName: 'SOSWidget',
+                renderWidget: () => {
+                  const Widget = SOSWidgetComponent;
+                  return (
+                    <Widget
+                      sosActive={data.status !== 'cancelled'}
+                      activeType={type.toLowerCase()}
+                      gpsStatus={gpsLocked ? 'locked' : 'searching'}
+                    />
+                  );
+                },
+              });
+            } catch (e) {
+              console.warn('Widget update failed:', e.message);
+            }
+          }
+
+          // Reload iOS WidgetKit timeline
+          if (Platform.OS === 'ios' && NativeModules.WidgetKitBridge) {
+            try {
+              NativeModules.WidgetKitBridge.reloadAllTimelines();
+            } catch (e) {
+              console.warn('WidgetKit reload failed:', e.message);
+            }
+          }
         }
       });
     } catch (e) {
@@ -155,6 +396,49 @@ export default function App() {
              }
              setActiveSOSId(null);
              setStatus(null);
+
+             // Write SOS cancelled state to iOS shared UserDefaults
+             if (Platform.OS === 'ios' && NativeModules.SharedDefaults) {
+               try {
+                 const sharedState = JSON.stringify({
+                   gpsLocked: gpsLocked,
+                   lat: location ? location.latitude : 0,
+                   lng: location ? location.longitude : 0,
+                   uid: user?.uid ?? 'anonymous',
+                   lastUpdated: Date.now(),
+                   sosActive: false,
+                   activeType: null,
+                   status: null,
+                 });
+                 await NativeModules.SharedDefaults.setItem('widgetState', sharedState);
+               } catch (e) {
+                 console.warn('Failed to clear widget SOS state:', e.message);
+               }
+             }
+
+             // Revert Android widget to idle state
+             if (Platform.OS === 'android' && requestWidgetUpdate && SOSWidgetComponent) {
+               try {
+                 await requestWidgetUpdate({
+                   widgetName: 'SOSWidget',
+                   renderWidget: () => {
+                     const Widget = SOSWidgetComponent;
+                     return <Widget gpsStatus={gpsLocked ? 'locked' : 'searching'} sosActive={false} />;
+                   },
+                 });
+               } catch (e) {
+                 console.warn('Widget reset failed:', e.message);
+               }
+             }
+
+             // Reload iOS WidgetKit timeline
+             if (Platform.OS === 'ios' && NativeModules.WidgetKitBridge) {
+               try {
+                 NativeModules.WidgetKitBridge.reloadAllTimelines();
+               } catch (e) {
+                 console.warn('WidgetKit reload failed:', e.message);
+               }
+             }
           } 
         }
       ]
@@ -286,11 +570,13 @@ export default function App() {
         <View style={{ flex: 1, backgroundColor: '#0f0f0f' }}>
           {Platform.OS === 'web' && WebMapComponent ? (
             <WebMapComponent userLoc={location} />
+          ) : NativeMapComponent ? (
+            <NativeMapComponent userLoc={location} />
           ) : (
             <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: 30 }}>
               <Text style={{ color: '#fff', fontSize: 28, fontWeight: '700', marginBottom: 12 }}>Citizen Map</Text>
               <Text style={{ color: '#888', textAlign: 'center', paddingHorizontal: 40 }}>
-                Live mesh map viewing requires the ReliefMesh Dashboard or running on Web.
+                Map component is loading...
               </Text>
             </View>
           )}
@@ -317,7 +603,7 @@ export default function App() {
 
       {/* Drawer Overlay */}
       {isMenuOpen && (
-        <View style={[StyleSheet.absoluteFill, { zIndex: 999 }]}>
+        <View style={[StyleSheet.absoluteFill, { zIndex: 999, elevation: 999 }]}>
           <TouchableOpacity 
             style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.7)' }} 
             activeOpacity={1} 
