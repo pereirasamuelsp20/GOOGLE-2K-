@@ -4,8 +4,30 @@ import * as Location from 'expo-location';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, setDoc, onSnapshot } from 'firebase/firestore';
 import { auth, firestore } from './src/firebaseConfig';
-import { MapPin, Flame, Activity as ActivitySquare, ShieldAlert, Wifi, WifiOff, Menu, Map as MapIcon, User, X } from 'lucide-react-native';
+import { MapPin, Flame, Activity as ActivitySquare, ShieldAlert, Wifi, WifiOff, Menu, Map as MapIcon, User, X, AlertTriangle } from 'lucide-react-native';
 import AuthScreen from './src/AuthScreen';
+import ReportIssueScreen from './src/ReportIssueScreen';
+import { ORS_API_KEY } from './src/orsConfig';
+
+// API base for backend calls
+const LAN_IP = '192.168.29.99';
+const API_BASE = `http://${LAN_IP}:4000/api`;
+
+// SOS type → facility type mapping
+const SOS_FACILITY_MAP = {
+  'Fire': 'fire_station',
+  'Medical': 'hospital',
+  'Security': 'police',
+  'General': 'police',
+};
+
+// SOS type → vehicle emoji
+const VEHICLE_ICONS = {
+  'Fire': '🚒',
+  'Medical': '🚑',
+  'Security': '🚔',
+  'General': '🚔',
+};
 
 // Widget imports — only available on native platforms after prebuild
 let requestWidgetUpdate = null;
@@ -41,6 +63,11 @@ export default function App() {
 
   const [currentScreen, setCurrentScreen] = useState('Home');
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+
+  // Dispatch simulation state
+  const [dispatchData, setDispatchData] = useState(null);
+  const dispatchTimersRef = useRef([]);
+  const vehicleIntervalRef = useRef(null);
 
   const glowAnim = useRef(new Animated.Value(1)).current;
   const expandAnim = useRef(new Animated.Value(0)).current;
@@ -202,6 +229,134 @@ export default function App() {
     ).start();
   }, []);
 
+  // ── Dispatch Simulation ──
+  const clearDispatch = useCallback(() => {
+    dispatchTimersRef.current.forEach(t => clearTimeout(t));
+    dispatchTimersRef.current = [];
+    if (vehicleIntervalRef.current) {
+      clearInterval(vehicleIntervalRef.current);
+      vehicleIntervalRef.current = null;
+    }
+    setDispatchData(null);
+  }, []);
+
+  const startDispatchSimulation = useCallback(async (sosType, sosId, userLat, userLng) => {
+    const facilityType = SOS_FACILITY_MAP[sosType] || 'police';
+    const vehicleIcon = VEHICLE_ICONS[sosType] || '🚔';
+
+    // 1. Fetch nearest facility
+    let facility;
+    try {
+      const res = await fetch(`${API_BASE}/locations/nearest?lat=${userLat}&lng=${userLng}&type=${facilityType}`);
+      if (res.ok) facility = await res.json();
+    } catch (e) { console.warn('Facility fetch failed:', e.message); }
+
+    if (!facility) {
+      // Fallback: use a default offset position
+      facility = { name: 'Emergency HQ', lat: userLat + 0.015, lng: userLng + 0.012, type: facilityType };
+    }
+
+    // 2. Fetch ORS route from facility → user
+    let routeCoords = [];
+    let totalDistance = 0;
+    let totalDuration = 0;
+    try {
+      const body = { coordinates: [[facility.lng, facility.lat], [userLng, userLat]] };
+      const res = await fetch('https://api.openrouteservice.org/v2/directions/driving-car/geojson', {
+        method: 'POST',
+        headers: { 'Authorization': ORS_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.features && data.features.length > 0) {
+        routeCoords = data.features[0].geometry.coordinates.map(c => [c[1], c[0]]); // [lat,lng]
+        const summary = data.features[0].properties.summary;
+        totalDistance = summary.distance;
+        totalDuration = summary.duration;
+      }
+    } catch (e) { console.warn('ORS route failed:', e.message); }
+
+    if (routeCoords.length === 0) {
+      // Fallback: straight line
+      routeCoords = [[facility.lat, facility.lng], [userLat, userLng]];
+      totalDistance = 3000;
+      totalDuration = 600;
+    }
+
+    // 3. Schedule "routed" after random 10-30s
+    const routedDelay = Math.floor(Math.random() * 20000) + 10000;
+    const t1 = setTimeout(async () => {
+      // Update Firestore
+      if (sosId !== 'dummy_path') {
+        try { await setDoc(doc(firestore, 'sos', sosId), { status: 'routed' }, { merge: true }); } catch (e) {}
+      }
+      setStatus('routed');
+
+      // Show vehicle at facility (start of route)
+      setDispatchData({
+        route: routeCoords,
+        vehiclePos: { lat: routeCoords[0][0], lng: routeCoords[0][1] },
+        facilityName: facility.name,
+        facilityType: facility.type,
+        vehicleIcon,
+        eta: Math.ceil(totalDuration / 60) + ' min',
+        progress: 0,
+      });
+
+      // Auto-switch to Map to show the dispatch
+      setCurrentScreen('Map');
+
+      // 4. Schedule "responding" after random 30-60s
+      const respondDelay = Math.floor(Math.random() * 30000) + 30000;
+      const t2 = setTimeout(async () => {
+        if (sosId !== 'dummy_path') {
+          try { await setDoc(doc(firestore, 'sos', sosId), { status: 'responding' }, { merge: true }); } catch (e) {}
+        }
+        setStatus('responding');
+
+        // 5. Start vehicle movement every 15s
+        // 5. Start vehicle movement every 15s — synced to ORS duration
+        // Vehicle takes totalDuration seconds to traverse the route.
+        // Add 10-20% buffer for realistic "traffic" delay.
+        const trafficMultiplier = 1 + (Math.random() * 0.1 + 0.1); // 1.1x to 1.2x
+        const adjustedDuration = totalDuration * trafficMultiplier;
+        const startTime = Date.now();
+
+        vehicleIntervalRef.current = setInterval(() => {
+          const elapsed = (Date.now() - startTime) / 1000; // seconds since responding
+          const progress = Math.min(elapsed / adjustedDuration, 1);
+          const idx = Math.min(Math.floor(progress * (routeCoords.length - 1)), routeCoords.length - 1);
+          const remainingSec = Math.max(0, adjustedDuration - elapsed);
+          const etaMin = Math.ceil(remainingSec / 60);
+
+          setDispatchData(prev => prev ? {
+            ...prev,
+            vehiclePos: { lat: routeCoords[idx][0], lng: routeCoords[idx][1] },
+            eta: etaMin > 0 ? etaMin + ' min' : 'Arriving',
+            progress,
+          } : null);
+
+          // Vehicle arrived
+          if (progress >= 1) {
+            clearInterval(vehicleIntervalRef.current);
+            vehicleIntervalRef.current = null;
+            setTimeout(() => {
+              Alert.alert('🚨 Help Arrived', `${facility.name} responder has reached your location.`);
+              if (sosId !== 'dummy_path') {
+                try { setDoc(doc(firestore, 'sos', sosId), { status: 'arrived' }, { merge: true }); } catch (e) {}
+              }
+              setActiveSOSId(null);
+              setStatus(null);
+              clearDispatch();
+            }, 2000);
+          }
+        }, 15000);
+      }, respondDelay);
+      dispatchTimersRef.current.push(t2);
+    }, routedDelay);
+    dispatchTimersRef.current.push(t1);
+  }, [clearDispatch]);
+
   const handleMainButtonPress = () => {
     if (activeSOSId) return;
     
@@ -247,19 +402,16 @@ export default function App() {
           setStatus(data.status);
         }
       });
+
+      // Start dispatch simulation
+      startDispatchSimulation(type, sosId, lat, lng);
     } catch (e) {
       console.warn("Widget SOS DB write failed — using demo mode.", e.message);
       setActiveSOSId('dummy_path');
       setStatus("searching");
       setIsExpanded(false);
       
-      setTimeout(() => setStatus("routed"), 3000);
-      setTimeout(() => setStatus("responding"), 7000);
-      setTimeout(() => {
-        setActiveSOSId(null);
-        setStatus(null);
-        Alert.alert("Demo Over", "Emergency responded successfully.");
-      }, 12000);
+      startDispatchSimulation(type, 'dummy_path', lat, lng);
     }
   };
 
@@ -363,19 +515,16 @@ export default function App() {
           }
         }
       });
+
+      // Start dispatch simulation
+      startDispatchSimulation(type, sosId, lat, lng);
     } catch (e) {
       console.warn("DB writes failed - placeholder or offline mode active.", e.message);
       setActiveSOSId(`dummy_path`);
       setStatus("searching");
       setIsExpanded(false);
       
-      setTimeout(() => setStatus("routed"), 3000);
-      setTimeout(() => setStatus("responding"), 7000);
-      setTimeout(() => {
-        setActiveSOSId(null);
-        setStatus(null);
-        Alert.alert("Demo Over", "Emergency responded successfully.");
-      }, 12000);
+      startDispatchSimulation(type, 'dummy_path', lat, lng);
     }
   };
 
@@ -396,6 +545,7 @@ export default function App() {
              }
              setActiveSOSId(null);
              setStatus(null);
+             clearDispatch();
 
              // Write SOS cancelled state to iOS shared UserDefaults
              if (Platform.OS === 'ios' && NativeModules.SharedDefaults) {
@@ -571,7 +721,7 @@ export default function App() {
           {Platform.OS === 'web' && WebMapComponent ? (
             <WebMapComponent userLoc={location} />
           ) : NativeMapComponent ? (
-            <NativeMapComponent userLoc={location} />
+            <NativeMapComponent userLoc={location} dispatchData={dispatchData} />
           ) : (
             <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: 30 }}>
               <Text style={{ color: '#fff', fontSize: 28, fontWeight: '700', marginBottom: 12 }}>Citizen Map</Text>
@@ -599,6 +749,10 @@ export default function App() {
              <Text style={{ color: '#FF3B30', fontWeight: '800', letterSpacing: 1 }}>SIGN OUT securely</Text>
           </TouchableOpacity>
         </View>
+      )}
+
+      {currentScreen === 'Report' && (
+        <ReportIssueScreen />
       )}
 
       {/* Drawer Overlay */}
@@ -630,6 +784,11 @@ export default function App() {
             <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Profile'); setIsMenuOpen(false); }}>
               <User color={currentScreen === 'Profile' ? '#FF3B30' : '#888'} size={24} />
               <Text style={{ color: currentScreen === 'Profile' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>My Profile</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Report'); setIsMenuOpen(false); }}>
+              <AlertTriangle color={currentScreen === 'Report' ? '#FF3B30' : '#888'} size={24} />
+              <Text style={{ color: currentScreen === 'Report' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Report an Issue</Text>
             </TouchableOpacity>
           </View>
         </View>

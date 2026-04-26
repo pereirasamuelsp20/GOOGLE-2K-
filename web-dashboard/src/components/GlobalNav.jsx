@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Menu, X, Map, User, LayoutDashboard, LogOut } from 'lucide-react';
+import { Menu, X, Map, User, LayoutDashboard, LogOut, AlertTriangle, Flame } from 'lucide-react';
 
 export default function GlobalNav() {
   const [isOpen, setIsOpen] = useState(false);
@@ -9,6 +9,15 @@ export default function GlobalNav() {
   if (location.pathname === '/' || location.pathname === '') {
     return null; // Don't show on Auth screen
   }
+
+  const isActive = (path) => location.pathname === path;
+
+  const getNavLinkStyle = (path) => ({
+    ...navLinkStyle,
+    background: isActive(path) ? 'rgba(204, 0, 0, 0.15)' : 'transparent',
+    color: isActive(path) ? '#CC0000' : '#ccc',
+    borderLeft: isActive(path) ? '3px solid #CC0000' : '3px solid transparent',
+  });
 
   return (
     <>
@@ -55,11 +64,17 @@ export default function GlobalNav() {
               </button>
             </div>
 
-            <Link to="/dashboard" onClick={() => setIsOpen(false)} style={navLinkStyle}>
+            <Link to="/sos" onClick={() => setIsOpen(false)} style={getNavLinkStyle('/sos')} id="nav-sos-core">
+              <Flame size={20} /> SOS Core
+            </Link>
+            <Link to="/dashboard" onClick={() => setIsOpen(false)} style={getNavLinkStyle('/dashboard')}>
               <LayoutDashboard size={20} /> Dashboard
             </Link>
-            <Link to="/map" onClick={() => setIsOpen(false)} style={navLinkStyle}>
+            <Link to="/map" onClick={() => setIsOpen(false)} style={getNavLinkStyle('/map')}>
               <Map size={20} /> Citizen Map
+            </Link>
+            <Link to="/report-issue" onClick={() => setIsOpen(false)} style={getNavLinkStyle('/report-issue')} id="nav-report-issue">
+              <AlertTriangle size={20} /> Report an Issue
             </Link>
             
             <div style={{ margin: '16px 0', height: 1, backgroundColor: '#333' }} />
