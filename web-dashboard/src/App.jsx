@@ -4,6 +4,7 @@ import AuthScreen from './pages/AuthScreen';
 import CitizenMap from './pages/CitizenMap';
 import AdminLayout from './pages/AdminLayout';
 import Dashboard from './Dashboard';
+import EtaTracker from './pages/EtaTracker';
 import './index.css';
 import 'leaflet/dist/leaflet.css';
 
@@ -18,6 +19,7 @@ function App() {
         <Route path="/map" element={<CitizenMap />} />
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/admin/*" element={<AdminLayout />} />
+        <Route path="/eta" element={<EtaTracker />} />
       </Routes>
     </BrowserRouter>
   );

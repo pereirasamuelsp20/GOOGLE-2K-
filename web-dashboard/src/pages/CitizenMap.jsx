@@ -1,358 +1,510 @@
-import React, { useEffect, useState, useRef } from 'react';
-import { MapContainer, TileLayer, Circle, Polyline, Marker, useMapEvents } from 'react-leaflet';
-import { collection, onSnapshot, addDoc, serverTimestamp, query, orderBy, limit, doc, setDoc } from 'firebase/firestore';
-import { db, auth } from '../firebase';
-import { ORS_API_KEY } from '../config';
-import { Navigation, AlertTriangle, Shield, Flame, Activity as ActivitySquare, ChevronRight, Target } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { MapContainer, TileLayer, Marker, Circle, Polyline, useMap } from 'react-leaflet';
+import { collection, onSnapshot } from 'firebase/firestore';
 import L from 'leaflet';
+import { db } from '../firebase';
+import EtaTracker from './EtaTracker';
+import MarkerPanel from '../components/MarkerPanel';
 
-// Create a custom pulsing blue dot icon
-const createPulseIcon = () => {
-  return L.divIcon({
-    className: 'pulse-icon-container',
-    html: '<div class="pulse-dot-blue"></div>',
-    iconSize: [24, 24],
-    iconAnchor: [12, 12]
-  });
+/* ── Config ───────────────────────────────────────────────────────────── */
+const PLACE_CFG = {
+  hospital:     { icon: '🏥', color: '#FF3D3D' },
+  police:       { icon: '🚔', color: '#00C8FF' },
+  fire_station: { icon: '🚒', color: '#FF8C00' },
 };
+const SOS_TYPES = [
+  { key: 'ambulance', icon: '🚑', label: 'Ambulance',    color: '#FF3D3D' },
+  { key: 'police',    icon: '🚔', label: 'Police',       color: '#00C8FF' },
+  { key: 'fire',      icon: '🚒', label: 'Fire Brigade', color: '#FF8C00' },
+];
 
-const pulseIcon = createPulseIcon();
+/* ── OSRM helpers ───────────────────────────────────────────────────────── */
+function buildInstruction(step) {
+  const { type, modifier } = step.maneuver;
+  const name = step.name || 'the road';
+  const dir  = modifier ? modifier.replace('-', ' ') : '';
+  switch (type) {
+    case 'depart':   return `Head ${dir} on ${name}`;
+    case 'turn':     return `Turn ${dir} onto ${name}`;
+    case 'new name': return `Continue onto ${name}`;
+    case 'merge':    return `Merge ${dir} onto ${name}`;
+    case 'ramp':     return `Take the ramp ${dir || 'ahead'}`;
+    case 'fork':     return `Keep ${dir} at the fork`;
+    case 'arrive':   return `Arrive at destination`;
+    case 'roundabout': return `Enter roundabout`;
+    default:         return name ? `Continue on ${name}` : 'Continue';
+  }
+}
 
-// Custom hook to detect map clicks for routing
-function MapInteractionHandler({ routingMode, onMapClick }) {
-  useMapEvents({
-    click(e) {
-      if (routingMode) {
-        onMapClick(e.latlng);
-      }
-    }
+function maneuverArrow(modifier) {
+  switch (modifier) {
+    case 'left':        return '↰';
+    case 'right':       return '↱';
+    case 'slight left': return '↖';
+    case 'slight right':return '↗';
+    case 'sharp left':  return '◁';
+    case 'sharp right': return '▷';
+    case 'uturn':       return '↩';
+    default:            return '↑';
+  }
+}
+
+function fmtStepDist(m) {
+  return m >= 1000 ? `${(m/1000).toFixed(1)} km` : `${Math.round(m)} m`;
+}
+
+async function fetchOSRM(coords) {
+  const path = coords.map(c => `${c[0]},${c[1]}`).join(';');
+  const url  = `https://router.project-osrm.org/route/v1/driving/${path}?overview=full&geometries=geojson&steps=true`;
+  const res  = await fetch(url);
+  const data = await res.json();
+  if (data.code !== 'Ok' || !data.routes?.length) throw new Error('OSRM_FAIL');
+  const rawSteps = data.routes[0].legs[0]?.steps ?? [];
+  const steps = rawSteps.map(s => ({
+    instruction: buildInstruction(s),
+    arrow:       maneuverArrow(s.maneuver?.modifier),
+    distance:    s.distance,
+    duration:    s.duration,
+    type:        s.maneuver?.type,
+  })).filter(s => s.type !== 'arrive' || rawSteps.length === 1);
+  return {
+    duration: data.routes[0].duration,
+    distance: data.routes[0].distance,
+    polyline: data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]),
+    steps,
+  };
+}
+
+function haversineM(lat1, lng1, lat2, lng2) {
+  const R = 6371000, r = d => d * Math.PI / 180;
+  const a = Math.sin(r(lat2-lat1)/2)**2 +
+    Math.cos(r(lat1)) * Math.cos(r(lat2)) * Math.sin(r(lng2-lng1)/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function fmtDist(m) {
+  return m >= 1000 ? `${(m/1000).toFixed(1)} km` : `${Math.round(m)} m`;
+}
+
+/* ── Leaflet icons ───────────────────────────────────────────────────── */
+function makePlaceIcon(type, active = false) {
+  const c = PLACE_CFG[type] ?? { icon: '📍', color: '#fff' };
+  return L.divIcon({
+    className: '',
+    html: `<div class="cmap-place-marker${active ? ' active' : ''}" style="--mc:${c.color}">${c.icon}</div>`,
+    iconSize: [38, 38], iconAnchor: [19, 19],
   });
+}
+function makeDestIcon(type) {
+  const c = PLACE_CFG[type] ?? { icon: '📍', color: '#fff' };
+  return L.divIcon({
+    className: '',
+    html: `<div class="cmap-dest-marker" style="--mc:${c.color}">
+      <div class="cmap-dest-pulse"></div>
+      <span>${c.icon}</span>
+    </div>`,
+    iconSize: [52, 52], iconAnchor: [26, 26],
+  });
+}
+function makeUserIcon() {
+  return L.divIcon({
+    className: '',
+    html: `
+      <div class="cmap-user-marker">
+        <div class="cmap-user-ring cmap-user-ring--outer"></div>
+        <div class="cmap-user-ring cmap-user-ring--mid"></div>
+        <div class="cmap-user-core"></div>
+        <div class="cmap-user-label">YOU</div>
+      </div>`,
+    iconSize: [60, 72], iconAnchor: [30, 36],
+  });
+}
+function makeRespIcon(icon, color) {
+  return L.divIcon({
+    className: '',
+    html: `<div class="eta-leaf-icon" style="--ic:${color}">${icon}</div>`,
+    iconSize: [40, 40], iconAnchor: [20, 20],
+  });
+}
+const userIcon = makeUserIcon();
+
+/* ── Overpass ────────────────────────────────────────────────────────── */
+async function fetchNearby(lat, lng) {
+  const q = `[out:json][timeout:20];(
+    node["amenity"~"hospital|police|fire_station"](around:5000,${lat},${lng});
+    way["amenity"~"hospital|police|fire_station"](around:5000,${lat},${lng});
+  );out center qt 60;`;
+  const res  = await fetch('https://overpass-api.de/api/interpreter', {
+    method: 'POST', body: 'data=' + encodeURIComponent(q),
+  });
+  const data = await res.json();
+  return data.elements.map(el => ({
+    id: el.id, lat: el.lat ?? el.center?.lat, lng: el.lon ?? el.center?.lon,
+    type: el.tags?.amenity, name: el.tags?.name || el.tags?.['name:en'] || null,
+  })).filter(p => p.lat && p.lng && PLACE_CFG[p.type]);
+}
+
+/* ── FollowUser: re-centers map whenever GPS updates by >30m ──────── */
+function FollowUser({ loc, follow }) {
+  const map = useMap();
+  const prevLoc = useRef(null);
+
+  useEffect(() => {
+    if (!loc || !follow) return;
+    if (prevLoc.current) {
+      const [plat, plng] = prevLoc.current;
+      const dist = Math.abs(plat - loc[0]) * 111320 + Math.abs(plng - loc[1]) * 85000;
+      if (dist < 30) return; // skip tiny jitter
+    }
+    map.panTo(loc, { animate: true, duration: 0.6 });
+    prevLoc.current = loc;
+  }, [loc, follow, map]);
+
   return null;
 }
 
+/* ── RecenterBtn: snaps map to user location on tap ─────────────── */
+function RecenterBtn({ onClick }) {
+  return (
+    <button
+      id="recenter-btn"
+      className="cmap-recenter-btn"
+      onClick={onClick}
+      title="Re-center on my location"
+    >
+      ⊕
+    </button>
+  );
+}
+
+/* Auto-fit bounds to route polyline */
+function FitRoute({ polyline }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!polyline || polyline.length < 2) return;
+    const bounds = L.latLngBounds(polyline);
+    map.fitBounds(bounds, { padding: [56, 56], maxZoom: 16, animate: true, duration: 0.8 });
+  }, [polyline, map]);
+  return null;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CITIZENMAP
+═══════════════════════════════════════════════════════════════════════ */
 export default function CitizenMap() {
-  const [userLoc, setUserLoc] = useState([19.0760, 72.8777]); // Default Mumbai
-  const [zones, setZones] = useState([]);
-  const [reports, setReports] = useState([]);
-  
-  // States
-  const [isFeedOpen, setIsFeedOpen] = useState(false);
-  const [isReportSheetOpen, setIsReportSheetOpen] = useState(false);
-  const [reportReason, setReportReason] = useState('Debris');
-  const [showSosOptions, setShowSosOptions] = useState(false);
-  const [activeSosStatus, setActiveSosStatus] = useState(null);
-  const [activeSosId, setActiveSosId] = useState(null);
-  const [routingMode, setRoutingMode] = useState(false);
-  const [routePolyline, setRoutePolyline] = useState(null);
-  const [routeInfo, setRouteInfo] = useState(null);
+  const [userLoc,       setUserLoc]       = useState(null);
+  const [places,        setPlaces]        = useState([]);
+  const [blockades,     setBlockades]     = useState([]);
+  const [loadingPlaces, setLoadingPlaces] = useState(false);
 
-  const mapRef = useRef();
-  
-  // Geolocation
+  /* SOS */
+  const [sosPicker, setSosPicker] = useState(false);
+  const [activeSos, setActiveSos] = useState(null);
+  const [respPos,   setRespPos]   = useState(null);
+  const [sosRoute,  setSosRoute]  = useState(null);
+
+  /* Navigate-to-place */
+  const [selectedPlace,  setSelectedPlace]  = useState(null);
+  const [navMode,        setNavMode]        = useState(null);
+  const [navLoading,     setNavLoading]     = useState(false);
+  const [currentStepIdx, setCurrentStepIdx] = useState(0);
+  const [following,      setFollowing]      = useState(true); // map follows user GPS
+
+  const fetchedAtRef = useRef(null);
+
+  /* GPS — extended timeout for mobile first-fix */
   useEffect(() => {
-    const watchId = navigator.geolocation.watchPosition(
-      pos => {
-        setUserLoc([pos.coords.latitude, pos.coords.longitude]);
-      },
-      err => console.warn(err),
-      { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+    if (!navigator.geolocation) { setUserLoc([19.076, 72.8777]); return; }
+    const fb = setTimeout(() => setUserLoc(p => p ?? [19.076, 72.8777]), 12000);
+    const id = navigator.geolocation.watchPosition(
+      pos => { clearTimeout(fb); setUserLoc([pos.coords.latitude, pos.coords.longitude]); },
+      ()  => { clearTimeout(fb); setUserLoc([19.076, 72.8777]); },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
-    return () => navigator.geolocation.clearWatch(watchId);
+    return () => { clearTimeout(fb); navigator.geolocation.clearWatch(id); };
   }, []);
 
-  // Zones Listener (Firestore)
+  /* Overpass */
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, 'zones'), snap => {
-      const z = [];
-      const now = Date.now();
-      snap.forEach(doc => {
-        const d = doc.data();
-        if(!d.center || !d.updatedAt) return;
-        
-        let timeDiff = 0;
-        if (d.updatedAt.toMillis) {
-           timeDiff = now - d.updatedAt.toMillis();
-        } else if (typeof d.updatedAt === 'number') {
-           timeDiff = now - d.updatedAt;
-        }
+    if (!userLoc) return;
+    const prev = fetchedAtRef.current;
+    if (prev && haversineM(prev[0], prev[1], userLoc[0], userLoc[1]) < 800) return;
+    fetchedAtRef.current = userLoc;
+    setLoadingPlaces(true);
+    fetchNearby(userLoc[0], userLoc[1])
+      .then(setPlaces).catch(console.error)
+      .finally(() => setLoadingPlaces(false));
+  }, [userLoc]);
 
-        const maxAge = 4 * 60 * 60 * 1000;
-        if (timeDiff > maxAge) return; // Hide older than 4 hours
-
-        const calcOpacity = Math.max(0, 1 - (timeDiff / maxAge));
-        z.push({ id: doc.id, ...d, dynamicOpacity: calcOpacity });
-      });
-      setZones(z);
-    });
-    return () => unsub();
-  }, []);
-
-  // Reports Listener (Firestore)
+  /* Firestore blockades */
   useEffect(() => {
-    const q = query(collection(db, 'reports'), orderBy('createdAt', 'desc'), limit(30));
-    const unsub = onSnapshot(q, snap => {
-      const r = [];
-      snap.forEach(doc => r.push({ id: doc.id, ...doc.data() }));
-      setReports(r);
+    const unsub = onSnapshot(collection(db, 'blockades'), snap => {
+      const bs = [];
+      snap.forEach(d => { const data = d.data(); if (data.lat && data.lng) bs.push({ id: d.id, ...data }); });
+      setBlockades(bs);
     });
-    return () => unsub();
+    return unsub;
   }, []);
 
-  const handleLocateMe = () => {
-    if (mapRef.current && userLoc) {
-      mapRef.current.flyTo(userLoc, 15, { duration: 1.5 });
-    }
-  };
-
-  const handleReportSubmit = async () => {
-    await addDoc(collection(db, 'zones'), {
-      type: 'blocked',
-      center: { lat: userLoc[0], lng: userLoc[1] },
-      radius: 100,
-      confidence: 0.2,
-      reason: reportReason,
-      updatedAt: serverTimestamp()
-    });
-    setIsReportSheetOpen(false);
-    // Real implementation would use a toast library here
-    alert("Road reported — thank you");
-  };
-
-  const calculateRoute = async (destLatLng) => {
-    setRoutingMode(false);
-    
-    // Prepare avoid polygons (danger + blocked)
-    const avoidPolygons = zones.filter(z => z.type === 'danger' || z.type === 'blocked').map(z => {
-      // Rough approximation of circle to polygon (bounding box or simple diamond for ORS)
-      // OpenRouteService avoid_polygons expects an array of polygons, each polygon is array of [lng, lat]
-      const latOffset = (z.radius / 111320);
-      const lngOffset = (z.radius / (40075000 * Math.cos(z.center.lat * Math.PI / 180) / 360));
-      return [
-        [z.center.lng - lngOffset, z.center.lat - latOffset],
-        [z.center.lng + lngOffset, z.center.lat - latOffset],
-        [z.center.lng + lngOffset, z.center.lat + latOffset],
-        [z.center.lng - lngOffset, z.center.lat + latOffset],
-        [z.center.lng - lngOffset, z.center.lat - latOffset] // close loop
-      ];
-    });
-
-    const body = {
-      coordinates: [
-        [userLoc[1], userLoc[0]], // [lng, lat]
-        [destLatLng.lng, destLatLng.lat]
-      ]
-    };
-
-    if (avoidPolygons.length > 0) {
-      body.options = { avoid_polygons: { type: "MultiPolygon", coordinates: [avoidPolygons] } };
-    }
-
+  /* ── Navigate: fetch OSRM, close panel, enter nav mode ────────────── */
+  const handleRoute = async (place) => {
+    if (!userLoc || navLoading) return;
+    setNavLoading(true);
+    setSelectedPlace(null);
+    setCurrentStepIdx(0);
     try {
-      const res = await fetch('https://api.openrouteservice.org/v2/directions/driving-car/geojson', {
-        method: 'POST',
-        headers: {
-          'Authorization': ORS_API_KEY,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body)
+      const result = await fetchOSRM([[userLoc[1], userLoc[0]], [place.lng, place.lat]]);
+      setNavMode({
+        place,
+        polyline: result.polyline,
+        etaMin:  Math.ceil(result.duration / 60),
+        distM:   result.distance,
+        source:  'OSRM',
+        steps:   result.steps ?? [],
       });
-      const data = await res.json();
-      if (data.features && data.features.length > 0) {
-        const coords = data.features[0].geometry.coordinates.map(c => [c[1], c[0]]); // Leaflet uses [lat, lng]
-        setRoutePolyline(coords);
-        
-        const summary = data.features[0].properties.summary;
-        setRouteInfo({ distance: (summary.distance / 1000).toFixed(1) + ' km', duration: Math.ceil(summary.duration / 60) + ' min' });
-      } else {
-        alert("Could not find a safe route.");
-      }
-    } catch(e) {
-      alert("Routing failed: " + e.message);
+    } catch (_) {
+      const dist = haversineM(userLoc[0], userLoc[1], place.lat, place.lng);
+      setNavMode({
+        place,
+        polyline: [[userLoc[0], userLoc[1]], [place.lat, place.lng]],
+        etaMin:  Math.ceil(dist / (40/3.6) / 60),
+        distM:   dist,
+        source:  'HVRSN',
+        steps:   [{ arrow: '↑', instruction: 'Head toward destination', distance: dist }],
+      });
     }
+    setNavLoading(false);
   };
 
-  const sendSOS = async (type) => {
-    setShowSosOptions(false);
-    const ts = Date.now().toString();
-    const uid = auth.currentUser?.uid || 'anon';
-    
-    const payload = {
-      uid,
-      type,
-      lat: userLoc[0],
-      lng: userLoc[1],
-      status: 'searching',
-      message: '',
-      timestamp: Date.now()
-    };
-    
-    await setDoc(doc(db, 'sos', ts), payload);
-    setActiveSosId(ts);
-    setActiveSosStatus('searching');
-    
-    // Live Strip Listener
-    onSnapshot(doc(db, 'sos', ts), snap => {
-      if (snap.exists()) {
-        const data = snap.data();
-        if (data && data.status) {
-          setActiveSosStatus(data.status);
-          if (data.status === 'cancelled') {
-             setActiveSosStatus(null);
-             setActiveSosId(null);
-          }
-        }
-      }
-    });
-  };
+  /* Advance step when user gets within 30m of next step start */
+  useEffect(() => {
+    if (!navMode?.steps?.length || !userLoc) return;
+    const nextIdx = currentStepIdx + 1;
+    if (nextIdx >= navMode.steps.length) return;
+    // Rough check: if remaining distance < sum of upcoming step distances, advance
+    const stepsDone = navMode.steps.slice(0, nextIdx).reduce((s, st) => s + st.distance, 0);
+    const totalDone = haversineM(userLoc[0], userLoc[1], navMode.place.lat, navMode.place.lng);
+    if (totalDone < navMode.distM - stepsDone + 30) setCurrentStepIdx(nextIdx);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userLoc]);
 
-  const cancelSOS = async () => {
-    if (activeSosId) {
-      await setDoc(doc(db, 'sos', activeSosId), { status: 'cancelled' }, { merge: true });
-      setActiveSosStatus(null);
-      setActiveSosId(null);
-      alert('SOS Cancelled');
-    }
-  };
+  const stopNavigation = () => setNavMode(null);
 
-  const getZoneColor = (type) => {
-    if(type === 'danger') return '#dc2626';
-    if(type === 'blocked') return '#f97316';
-    if(type === 'safe') return '#22c55e';
-    return '#3b82f6';
-  };
+  const activeSosCfg = SOS_TYPES.find(s => s.key === activeSos);
+  const respIcon     = activeSosCfg ? makeRespIcon(activeSosCfg.icon, activeSosCfg.color) : null;
 
   return (
-    <div style={{ position: 'relative', height: '100vh', width: '100vw' }}>
-      
-      {/* Map Layer */}
-      <MapContainer 
-        center={userLoc} 
-        zoom={13} 
-        ref={mapRef}
-        zoomControl={false}
-        style={{ height: '100%', width: '100%' }}
-      >
-        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-        
-        <MapInteractionHandler routingMode={routingMode} onMapClick={calculateRoute} />
+    <div style={{ position: 'relative', height: '100dvh', width: '100vw', background: '#070b0f', overflow: 'hidden' }}>
 
-        <Marker position={userLoc} icon={pulseIcon} />
-
-        {zones.map((z, i) => (
-          <Circle 
-            key={z.id || i}
-            center={[z.center.lat, z.center.lng]}
-            radius={z.radius}
-            pathOptions={{ color: getZoneColor(z.type), fillColor: getZoneColor(z.type), fillOpacity: z.dynamicOpacity * 0.4, opacity: z.dynamicOpacity }}
+      {/* ── MAP ─────────────────────────────────────────────────────── */}
+      {userLoc && (
+        <MapContainer center={userLoc} zoom={14}
+          zoomControl={false} attributionControl={false}
+          style={{ height: '100%', width: '100%' }}>
+          <TileLayer
+            url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+            subdomains="abcd" maxZoom={19}
           />
-        ))}
 
-        {routePolyline && (
-          <Polyline positions={routePolyline} pathOptions={{ color: '#3b82f6', weight: 5 }} />
-        )}
-      </MapContainer>
+          <FollowUser loc={userLoc} follow={following && !navMode} />
 
-      {/* Overlays / UI */}
-      
-      {/* Live Feed Sidebar */}
-      <div className={`live-feed-panel ${isFeedOpen ? 'open' : ''}`}>
-        <button className="feed-toggle" onClick={() => setIsFeedOpen(!isFeedOpen)}>
-          <ChevronRight size={20} style={{ transform: isFeedOpen ? 'rotate(180deg)' : 'none', transition: '0.3s' }} />
+          {/* Auto-fit when nav mode activates */}
+          {navMode && <FitRoute polyline={navMode.polyline} />}
+
+          {/* User */}
+          <Marker position={userLoc} icon={userIcon} />
+
+          {/* Blockades */}
+          {blockades.map(b => (
+            <Circle key={b.id} center={[b.lat, b.lng]} radius={b.radius ?? 150}
+              pathOptions={{ color: '#FF0000', fillColor: '#FF0000', fillOpacity: 0.25, weight: 2 }} />
+          ))}
+
+          {/* Place markers — dim when in nav mode */}
+          {places.map(p => (
+            <Marker key={p.id} position={[p.lat, p.lng]}
+              icon={makePlaceIcon(p.type, navMode?.place?.id === p.id)}
+              eventHandlers={{ click: () => {
+                if (navMode) return; // ignore taps while navigating
+                setSelectedPlace(p);
+              }}}
+            />
+          ))}
+
+          {/* SOS responder */}
+          {respPos && respIcon && <Marker position={[respPos.lat, respPos.lng]} icon={respIcon} />}
+
+          {/* SOS route */}
+          {sosRoute && (
+            <Polyline positions={sosRoute}
+              pathOptions={{ color: activeSosCfg?.color ?? '#FF3D3D', weight: 5, opacity: 0.85 }} />
+          )}
+
+          {/* ── Navigation route — Google Maps style ──────────────── */}
+          {navMode?.polyline && (
+            <>
+              {/* White shadow/border underneath */}
+              <Polyline positions={navMode.polyline}
+                pathOptions={{ color: '#ffffff', weight: 12, opacity: 0.2, lineCap: 'round', lineJoin: 'round' }} />
+              {/* Main vivid route line */}
+              <Polyline positions={navMode.polyline}
+                pathOptions={{ color: '#0096FF', weight: 8, opacity: 1, lineCap: 'round', lineJoin: 'round' }} />
+            </>
+          )}
+
+          {/* Destination pin */}
+          {navMode?.place && (
+            <Marker
+              position={[navMode.place.lat, navMode.place.lng]}
+              icon={makeDestIcon(navMode.place.type)}
+            />
+          )}
+        </MapContainer>
+      )}
+
+      {/* ── LOADING BADGE ────────────────────────────────────────── */}
+      {loadingPlaces && (
+        <div className="cmap-loading-badge">
+          <span className="cmap-loading-dot" />Fetching nearby services…
+        </div>
+      )}
+      {navLoading && (
+        <div className="cmap-loading-badge">
+          <span className="cmap-loading-dot" />Calculating route…
+        </div>
+      )}
+
+      {/* ── RECENTER BUTTON ──────────────────────────────────────── */}
+      {!navMode && (
+        <button
+          id="recenter-btn"
+          className={`cmap-recenter-btn${following ? ' active' : ''}`}
+          onClick={() => { setFollowing(true); }}
+          title="Re-center on my location"
+        >
+          ◎
         </button>
-        <div style={{ padding: 20 }}>
-          <h3 style={{ marginBottom: 16 }}>Live Community Feed</h3>
-          {reports.map(r => (
-            <div key={r.id} style={{ padding: 12, borderBottom: '1px solid var(--border-color)', fontSize: 13 }}>
-              <strong>{r.category || 'Update'}</strong>
-              <p style={{ color: 'var(--text-muted)' }}>{r.description}</p>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 11 }}>
-                <span style={{ color: 'var(--text-muted)' }}>{r.createdAt?.toDate ? r.createdAt.toDate().toLocaleTimeString() : 'Recent'}</span>
-                {r.upvotes > 3 && <span style={{ color: 'var(--accent-green)', fontWeight: 600 }}>Verified ✓</span>}
-              </div>
+      )}
+
+      {/* ── LEGEND (hide during nav mode) ────────────────────────── */}
+      {!navMode && (
+        <div className="cmap-legend">
+          {Object.entries(PLACE_CFG).map(([k, c]) => (
+            <div key={k} className="cmap-legend-row">
+              <span style={{ fontSize: 13 }}>{c.icon}</span>
+              <span className="cmap-legend-label">
+                {{ hospital: 'Hospital', police: 'Police', fire_station: 'Fire Stn' }[k]}
+              </span>
             </div>
           ))}
-        </div>
-      </div>
-
-      {/* Floating Buttons */}
-      <button className="fab-report" onClick={() => setIsReportSheetOpen(true)}>
-        <AlertTriangle size={20} />
-      </button>
-
-      <button className="fab-locate" onClick={handleLocateMe}>
-        <Target size={20} />
-      </button>
-
-      <button className="btn-get-route" onClick={() => { setRoutingMode(true); alert("Tap your destination on the map"); }}>
-        <Navigation size={18} /> GET SAFE ROUTE
-      </button>
-
-      {routeInfo && (
-        <div className="route-info-strip">
-          Safe Route: {routeInfo.distance} • {routeInfo.duration}
-          <button style={{ marginLeft: 16, background: 'none', border: 'none', color: '#fff' }} onClick={() => {setRouteInfo(null); setRoutePolyline(null);}}>✕</button>
+          {blockades.length > 0 && (
+            <div className="cmap-legend-row">
+              <span className="cmap-blockade-dot" />
+              <span className="cmap-legend-label">Blockade</span>
+            </div>
+          )}
         </div>
       )}
 
-      {/* SOS System */}
-      <div className={`sos-arc-container ${showSosOptions ? 'open' : ''}`}>
-        <button className="sos-option fire" onClick={() => sendSOS('Fire')}><Flame size={20}/></button>
-        <button className="sos-option medical" onClick={() => sendSOS('Medical')}><ActivitySquare size={20}/></button>
-        <button className="sos-option security" onClick={() => sendSOS('Security')}><Shield size={20}/></button>
-        
-        <button className="fab-sos-main" onClick={() => setShowSosOptions(!showSosOptions)}>
-          <span style={{ fontSize: 20, fontWeight: 800 }}>SOS</span>
+      {/* ── SOS FAB (hide during active SOS) ─────────────────────── */}
+      {!activeSos && (
+        <button id="sos-fab-btn" className="cmap-sos-fab"
+          onClick={() => setSosPicker(true)}>
+          <span className="cmap-sos-fab-text">SOS</span>
         </button>
-      </div>
-
-      {activeSosStatus && (
-        <div className="sos-status-strip" style={{ position: 'absolute', bottom: 120, left: '50%', transform: 'translateX(-50%)', zIndex: 1000, width: '90%', maxWidth: 400 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div className={`status-node ${activeSosStatus === 'searching' || activeSosStatus === 'routed' || activeSosStatus === 'responding' ? 'active' : ''}`}>Searching</div>
-            <div className="status-line" style={{ flex: 1, height: 2, background: 'var(--border-color)', margin: '0 8px' }} />
-            <div className={`status-node ${activeSosStatus === 'routed' || activeSosStatus === 'responding' ? 'active' : ''}`}>Routed</div>
-            <div className="status-line" style={{ flex: 1, height: 2, background: 'var(--border-color)', margin: '0 8px' }} />
-            <div className={`status-node ${activeSosStatus === 'responding' ? 'active' : ''}`}>Respond</div>
-          </div>
-          
-          <button 
-            onClick={cancelSOS}
-            style={{
-              marginTop: 16, width: '100%', padding: 12, background: 'rgba(220,38,38,0.2)', border: '1px solid var(--primary-red)',
-              color: 'var(--primary-red)', borderRadius: 8, fontWeight: 700, cursor: 'pointer'
-            }}
-          >
-            CANCEL SOS
-          </button>
-        </div>
       )}
 
-      {/* Bottom Sheet Report */}
-      {isReportSheetOpen && (
+      {/* ── SOS PICKER ───────────────────────────────────────────── */}
+      {sosPicker && (
         <>
-          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 999 }} onClick={() => setIsReportSheetOpen(false)} />
-          <div className="bottom-sheet">
-            <h3 style={{ marginBottom: 16 }}>Report Hazard</h3>
-            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
-              {['Flood', 'Debris', 'Fire', 'Accident', 'Other'].map(r => (
-                <button 
-                  key={r}
-                  onClick={() => setReportReason(r)}
-                  style={{ 
-                    background: reportReason === r ? 'rgba(220,38,38,0.2)' : 'rgba(255,255,255,0.05)',
-                    border: `1px solid ${reportReason === r ? 'var(--primary-red)' : 'var(--border-color)'}`,
-                    color: reportReason === r ? 'var(--primary-red)' : 'white',
-                    padding: '8px 16px', borderRadius: 20, fontWeight: 600, cursor: 'pointer'
-                  }}>
-                  {r}
+          <div className="mp-backdrop" onClick={() => setSosPicker(false)} />
+          <div className="cmap-sos-sheet">
+            <div className="mp-handle-row" onClick={() => setSosPicker(false)}>
+              <div className="mp-handle-bar" />
+            </div>
+            <div className="cmap-sos-sheet-title">REQUEST HELP</div>
+            <div className="cmap-sos-sheet-sub">Select the type of emergency response needed</div>
+            <div className="cmap-sos-types">
+              {SOS_TYPES.map(s => (
+                <button key={s.key} id={`sos-type-${s.key}`}
+                  className="cmap-sos-type-btn" style={{ '--sc': s.color }}
+                  onClick={() => { setSosPicker(false); setActiveSos(s.key); }}>
+                  <span className="cmap-sos-type-icon">{s.icon}</span>
+                  <span className="cmap-sos-type-label">{s.label.toUpperCase()}</span>
                 </button>
               ))}
             </div>
-            <button className="btn-primary" onClick={handleReportSubmit}>Submit to Mesh</button>
           </div>
         </>
       )}
 
+      {/* ── ETA TRACKER (SOS flow) ───────────────────────────────── */}
+      {activeSos && userLoc && (
+        <EtaTracker
+          sosType={activeSos}
+          userLoc={userLoc}
+          blockades={blockades}
+          onDismiss={() => { setActiveSos(null); setRespPos(null); setSosRoute(null); }}
+          onRespPosChange={setRespPos}
+          onRouteChange={setSosRoute}
+        />
+      )}
+
+      {/* ── MARKER PANEL (place info + route trigger) ────────────── */}
+      {selectedPlace && !navMode && (
+        <MarkerPanel
+          place={selectedPlace}
+          userLoc={userLoc}
+          onClose={() => setSelectedPlace(null)}
+          onRoute={handleRoute}
+        />
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════
+          NAVIGATION STRIP — shown while routing to a place
+      ══════════════════════════════════════════════════════════════ */}
+      {navMode && (() => {
+        const step = navMode.steps?.[currentStepIdx];
+        return (
+          <div className="nav-strip">
+            {/* ── TOP: current turn instruction ── */}
+            {step && (
+              <div className="nav-instruction-bar">
+                <div className="nav-arrow">{step.arrow}</div>
+                <div className="nav-instruction-text">
+                  <div className="nav-instruction-main">{step.instruction}</div>
+                  <div className="nav-instruction-dist">{fmtStepDist(step.distance)}</div>
+                </div>
+                {navMode.steps.length > 1 && currentStepIdx + 1 < navMode.steps.length && (
+                  <div className="nav-next-hint">
+                    <span style={{ opacity: 0.4, fontSize: 10 }}>THEN</span>
+                    <span className="nav-next-arrow">{navMode.steps[currentStepIdx + 1].arrow}</span>
+                  </div>
+                )}
+              </div>
+            )}
+            {/* ── BOTTOM: ETA + stop ── */}
+            <div className="nav-strip-bottom">
+              <div className="nav-strip-left">
+                <div className="nav-strip-eta">{navMode.etaMin}</div>
+                <div className="nav-strip-unit">MIN</div>
+              </div>
+              <div className="nav-strip-mid">
+                <div className="nav-strip-name">{navMode.place.name || PLACE_CFG[navMode.place.type]?.label}</div>
+                <div className="nav-strip-meta">
+                  {fmtDist(navMode.distM)}
+                  <span className="nav-strip-src" style={{
+                    color: navMode.source === 'OSRM' ? '#00FF8C' : '#FFD600'
+                  }}> · {navMode.source}</span>
+                </div>
+              </div>
+              <button className="nav-strip-stop" id="nav-stop-btn" onClick={stopNavigation}>
+                ✕<span>END</span>
+              </button>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

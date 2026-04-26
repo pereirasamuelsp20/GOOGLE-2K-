@@ -3,6 +3,13 @@
 // DO NOT COMMIT REAL KEYS TO VERSION CONTROL WITHOUT SECURING THEM.
 
 /**
+ * Google Maps JavaScript API Key
+ * Enable: Maps JavaScript API + Directions API in Google Cloud Console
+ * Replace with your real key from https://console.cloud.google.com/apis/
+ */
+export const GOOGLE_MAPS_API_KEY = 'YOUR_GOOGLE_MAPS_API_KEY_HERE';
+
+/**
  * OpenRouteService Configuration
  * Replace with your real ORS key from https://openrouteservice.org/
  */
