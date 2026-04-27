@@ -248,7 +248,8 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
   };
 
   // No Admin self-signup — admin can only log in with existing credentials
-  const roles = ['Citizen', 'Volunteer', 'Responder'];
+  // No Admin or Responder self-signup — Responder is earned via role request approval
+  const roles = ['Citizen', 'Volunteer'];
 
   return (
     <View style={styles.container}>

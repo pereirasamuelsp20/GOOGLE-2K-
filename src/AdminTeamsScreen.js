@@ -6,6 +6,17 @@ import { Shield, CheckCircle, AlertTriangle, Plus } from 'lucide-react-native';
 
 const roleColors = { Doctor: '#dc2626', Nurse: '#3b82f6', Paramedic: '#22c55e', Driver: '#f59e0b' };
 
+// Helper: if a member's "name" is actually an email, extract and capitalize the username part
+const getMemberDisplayName = (member) => {
+  const name = member?.name || '';
+  if (!name) return member?.email ? member.email.split('@')[0] : 'Unknown';
+  if (name.includes('@')) {
+    const username = name.split('@')[0];
+    return username.charAt(0).toUpperCase() + username.slice(1);
+  }
+  return name;
+};
+
 export default function AdminTeamsScreen() {
   const [teams, setTeams] = useState([]);
 
@@ -99,7 +110,7 @@ export default function AdminTeamsScreen() {
                       <View style={[styles.roleDot, { backgroundColor: member ? rc : '#333' }]} />
                       <Text style={[styles.roleLabel, { color: rc }]}>{role}</Text>
                       {member ? (
-                        <Text style={styles.memberName}>{member.name}</Text>
+                        <Text style={styles.memberName}>{getMemberDisplayName(member)}</Text>
                       ) : (
                         <Text style={styles.memberVacant}>Vacant</Text>
                       )}
