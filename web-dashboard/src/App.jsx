@@ -1,7 +1,6 @@
 import React from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import AuthScreen from './pages/AuthScreen';
 import CitizenMap from './pages/CitizenMap';
 import AdminLayout from './pages/AdminLayout';
 import ReportIssue from './pages/ReportIssue';
@@ -32,7 +31,7 @@ function App() {
         <BrowserRouter>
           <GlobalNav />
           <Routes>
-            <Route path="/" element={<AuthScreen />} />
+            <Route path="/" element={<Navigate to="/admin" replace />} />
             <Route path="/map" element={<CitizenMap />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/messages" element={<MessagesScreen />} />

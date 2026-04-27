@@ -6,6 +6,7 @@ import { ORS_API_KEY } from '../config';
 import { Navigation, AlertTriangle, Shield, Flame, Activity as ActivitySquare, ChevronRight, Target } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import L from 'leaflet';
+import FALLBACK_LOCATIONS from '../data/importantLocations';
 
 // SOS → facility type mapping
 const SOS_FACILITY_MAP = { Fire: 'fire_station', Medical: 'hospital', Security: 'police' };
@@ -124,11 +125,15 @@ const fetchApiReports = async () => {
   return res.json();
 };
 
-// Fetch important locations from backend API
 const fetchLocations = async () => {
-  const res = await fetch(`${API_BASE}/locations`);
-  if (!res.ok) throw new Error('Failed to fetch locations');
-  return res.json();
+  try {
+    const res = await fetch(`${API_BASE}/locations`);
+    if (!res.ok) throw new Error('Failed to fetch locations');
+    return res.json();
+  } catch (e) {
+    console.warn('[CitizenMap] API unavailable, using fallback locations:', e.message);
+    return FALLBACK_LOCATIONS;
+  }
 };
 
 export default function CitizenMap() {
@@ -218,11 +223,13 @@ export default function CitizenMap() {
   });
 
   // Important Locations from backend API
-  const { data: importantLocations = [] } = useQuery({
+  const { data: importantLocations = FALLBACK_LOCATIONS } = useQuery({
     queryKey: ['importantLocations'],
     queryFn: fetchLocations,
-    staleTime: 5 * 60 * 1000, // cache 5 min
+    staleTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
+    initialData: FALLBACK_LOCATIONS,
+    retry: 1,
   });
 
   // Filtered locations based on toggle state

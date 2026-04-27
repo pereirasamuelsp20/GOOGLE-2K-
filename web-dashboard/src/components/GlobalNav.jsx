@@ -3,7 +3,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { Menu, X, Map, User, LayoutDashboard, LogOut, AlertTriangle, Flame, Radio, Bell, Users, Shield, Truck, MessageCircle } from 'lucide-react';
 import { auth, db } from '../firebase';
 import { doc, onSnapshot } from 'firebase/firestore';
-import { onAuthStateChanged } from 'firebase/auth';
+import { onAuthStateChanged, signOut } from 'firebase/auth';
 
 export default function GlobalNav() {
   const [isOpen, setIsOpen] = useState(false);
@@ -35,8 +35,13 @@ export default function GlobalNav() {
     return () => unsubAuth();
   }, []);
 
+  // Hide nav when not authenticated (auth screen is showing)
+  if (!auth.currentUser || auth.currentUser.isAnonymous) {
+    return null;
+  }
+
   if (location.pathname === '/' || location.pathname === '') {
-    return null; // Don't show on Auth screen
+    return null;
   }
 
   const isActive = (path) => location.pathname === path;
@@ -184,9 +189,16 @@ export default function GlobalNav() {
 
             <div style={{ flex: 1 }} />
 
-            <Link to="/" onClick={() => setIsOpen(false)} style={{ ...navLinkStyle, color: '#dc2626' }}>
+            <button
+              onClick={async () => {
+                setIsOpen(false);
+                await signOut(auth);
+                window.location.href = '/admin';
+              }}
+              style={{ ...navLinkStyle, color: '#dc2626', background: 'transparent', border: 'none', cursor: 'pointer', width: '100%' }}
+            >
               <LogOut size={20} /> Sign Out
-            </Link>
+            </button>
           </div>
         </div>
       )}

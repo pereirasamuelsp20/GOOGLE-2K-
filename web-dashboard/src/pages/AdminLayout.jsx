@@ -1,4 +1,5 @@
 import React from 'react';
+import FALLBACK_LOCATIONS from '../data/importantLocations';
 import { Routes, Route, useLocation } from 'react-router-dom';
 import AdminOverview from './admin/AdminOverview';
 import AdminAnnouncements from './admin/AdminAnnouncements';
@@ -158,10 +159,33 @@ function createLocIcon(type) {
 }
 
 const fetchLocations = async () => {
-  const res = await fetch(`${API_BASE}/locations`);
-  if (!res.ok) throw new Error('Failed to fetch locations');
-  return res.json();
+  try {
+    const res = await fetch(`${API_BASE}/locations`);
+    if (!res.ok) throw new Error('Failed to fetch locations');
+    return res.json();
+  } catch (e) {
+    console.warn('[MeshMap] API unavailable, using fallback locations:', e.message);
+    return FALLBACK_LOCATIONS;
+  }
 };
+
+// Mumbai landmarks — same as mobile app's NativeMapComponent
+const MUMBAI_LANDMARKS = [
+  { name: 'Gateway of India', lat: 18.9220, lng: 72.8347 },
+  { name: 'CST Station', lat: 18.9398, lng: 72.8355 },
+  { name: 'Bandra-Worli Sea Link', lat: 19.0380, lng: 72.8162 },
+  { name: 'Marine Drive', lat: 18.9432, lng: 72.8235 },
+  { name: 'Mumbai Airport', lat: 19.0896, lng: 72.8656 },
+  { name: 'Haji Ali', lat: 18.9827, lng: 72.8089 },
+  { name: 'Juhu Beach', lat: 19.0988, lng: 72.8267 },
+  { name: 'Siddhivinayak Temple', lat: 19.0169, lng: 72.8306 },
+];
+
+const landmarkIcon = L.divIcon({
+  className: '',
+  html: '<div style="width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.5);border:1px solid rgba(255,255,255,0.2)"></div>',
+  iconSize: [8, 8], iconAnchor: [4, 4],
+});
 
 // Mesh Map page (full map with SOS + issues + important locations)
 function AdminMeshMap() {
@@ -181,11 +205,13 @@ function AdminMeshMap() {
   }, []);
 
   // Fetch important locations
-  const { data: importantLocations = [] } = useQuery({
+  const { data: importantLocations = FALLBACK_LOCATIONS } = useQuery({
     queryKey: ['importantLocations'],
     queryFn: fetchLocations,
     staleTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
+    initialData: FALLBACK_LOCATIONS,
+    retry: 1,
   });
 
   const filteredLocations = importantLocations.filter(l => locationFilters[l.type]);
@@ -217,6 +243,17 @@ function AdminMeshMap() {
                 </div>
                 <div style={{ color: '#bbb', fontSize: 12, lineHeight: 1.4 }}>{loc.address}</div>
                 {loc.phone && <div style={{ color: '#999', fontSize: 12, marginTop: 4 }}>📞 {loc.phone}</div>}
+              </div>
+            </Popup>
+          </Marker>
+        ))}
+        {/* Mumbai Landmarks — same as mobile app */}
+        {MUMBAI_LANDMARKS.map((lm) => (
+          <Marker key={lm.name} position={[lm.lat, lm.lng]} icon={landmarkIcon}>
+            <Popup>
+              <div style={{ color: '#fff', minWidth: 140 }}>
+                <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 4 }}>{lm.name}</div>
+                <div style={{ color: '#888', fontSize: 10, textTransform: 'uppercase', letterSpacing: 1 }}>Mumbai Landmark</div>
               </div>
             </Popup>
           </Marker>
