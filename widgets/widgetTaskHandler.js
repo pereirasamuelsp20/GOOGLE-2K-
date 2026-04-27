@@ -9,19 +9,42 @@ import { getFirestore, doc, setDoc } from 'firebase/firestore';
 import * as Location from 'expo-location';
 import { requestWidgetUpdate } from 'react-native-android-widget';
 import { SOSWidget } from './SOSWidget';
+import { SOSConfirmWidget } from './SOSConfirmWidget';
 import { FIREBASE_CONFIG } from '../src/firebaseConfig';
 
 // --- Firebase init guard (safe for headless context) ---
 function getFirebaseApp() {
-  if (getApps().length === 0) {
-    return initializeApp(FIREBASE_CONFIG);
+  try {
+    if (getApps().length === 0) {
+      return initializeApp(FIREBASE_CONFIG);
+    }
+    return getApps()[0];
+  } catch (e) {
+    console.warn('Firebase init failed in widget handler:', e.message);
+    return null;
   }
-  return getApps()[0];
+}
+
+// --- Safe widget update wrapper ---
+async function safeWidgetUpdate(widgetName, renderFn) {
+  try {
+    await requestWidgetUpdate({
+      widgetName,
+      renderWidget: renderFn,
+    });
+  } catch (e) {
+    console.warn(`Widget update failed for ${widgetName}:`, e.message);
+  }
 }
 
 // --- Core SOS sender ---
 async function sendWidgetSOS(type) {
   const app = getFirebaseApp();
+  if (!app) {
+    console.warn('Firebase not available — cannot send widget SOS');
+    return null;
+  }
+
   const db = getFirestore(app);
 
   // Get last known location (foreground permission already granted by main app)
@@ -47,31 +70,36 @@ async function sendWidgetSOS(type) {
     status: 'searching',
     message: '[Widget SOS]',
     timestamp,
-    uid: 'widget_anonymous', // Replace with AsyncStorage uid lookup if auth is available
+    uid: 'widget_anonymous',
     source: 'widget',
   };
 
-  await setDoc(doc(db, 'sos', sosId), payload);
+  try {
+    await setDoc(doc(db, 'sos', sosId), payload);
+  } catch (e) {
+    console.warn('Widget SOS DB write failed:', e.message);
+  }
 
   // Update widget UI to active state
-  await requestWidgetUpdate({
-    widgetName: 'SOSWidget',
-    renderWidget: () => (
-      <SOSWidget sosActive={true} activeType={type.toLowerCase()} />
-    ),
-  });
+  await safeWidgetUpdate('SOSWidget', () => (
+    <SOSWidget sosActive={true} activeType={type.toLowerCase()} />
+  ));
 
   return sosId;
 }
 
 // --- Render idle state ---
 async function renderIdleWidget(widgetName) {
-  await requestWidgetUpdate({
-    widgetName,
-    renderWidget: () => (
-      <SOSWidget sosActive={false} />
-    ),
-  });
+  await safeWidgetUpdate(widgetName, () => (
+    <SOSWidget sosActive={false} activeType={null} />
+  ));
+}
+
+// --- Show confirm overlay ---
+async function showConfirmWidget(widgetName, sosType) {
+  await safeWidgetUpdate(widgetName, () => (
+    <SOSConfirmWidget pendingType={sosType.toLowerCase()} />
+  ));
 }
 
 // --- Main handler — receives widget lifecycle events ---
@@ -94,6 +122,23 @@ export async function widgetTaskHandler(props) {
     // --- Single tap: immediately send general SOS ---
     case 'TRIGGER_GENERAL_SOS':
       await sendWidgetSOS('General');
+      break;
+
+    // --- Confirm handlers from SOSConfirmWidget ---
+    case 'CONFIRM_SOS_FIRE':
+      await sendWidgetSOS('Fire');
+      break;
+
+    case 'CONFIRM_SOS_MEDICAL':
+      await sendWidgetSOS('Medical');
+      break;
+
+    case 'CONFIRM_SOS_SECURITY':
+      await sendWidgetSOS('Security');
+      break;
+
+    case 'CANCEL_SOS':
+      await renderIdleWidget(widgetName || 'SOSWidget');
       break;
 
     // --- Tapping active banner opens the app ---

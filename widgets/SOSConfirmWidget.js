@@ -2,6 +2,7 @@
 // Confirmation overlay shown before dispatching SOS from widget.
 // User must tap CONFIRM to send, or CANCEL to abort.
 // This prevents accidental SOS triggers from the home screen.
+// IMPORTANT: Android widgets do NOT support rgba() or gap — use hex and margins.
 
 import React from 'react';
 import {
@@ -10,18 +11,19 @@ import {
 } from 'react-native-android-widget';
 
 const TYPE_COLORS = {
-  fire: { bg: '#1A0A00', border: '#FF6B35', text: '#FF6B35', emoji: '🔥' },
-  medical: { bg: '#001A0F', border: '#00CC66', text: '#00CC66', emoji: '🏥' },
-  security: { bg: '#0A0A1A', border: '#4488FF', text: '#4488FF', emoji: '🛡' },
+  fire: { bg: '#1A0A00', border: '#FF6B35', text: '#FF6B35' },
+  medical: { bg: '#001A0F', border: '#00CC66', text: '#00CC66' },
+  security: { bg: '#0A0A1A', border: '#4488FF', text: '#4488FF' },
 };
 
 /**
  * @param {Object} props
  * @param {string} props.pendingType - 'fire' | 'medical' | 'security'
  */
-export function SOSConfirmWidget({ pendingType = 'fire' }) {
-  const colors = TYPE_COLORS[pendingType] || TYPE_COLORS.fire;
-  const typeUpper = pendingType.toUpperCase();
+export function SOSConfirmWidget({ pendingType }) {
+  const type = pendingType || 'fire';
+  const colors = TYPE_COLORS[type] || TYPE_COLORS.fire;
+  const typeUpper = type.toUpperCase();
 
   return (
     <FlexWidget
@@ -38,7 +40,7 @@ export function SOSConfirmWidget({ pendingType = 'fire' }) {
     >
       {/* Warning header */}
       <TextWidget
-        text={`${colors.emoji} SEND ${typeUpper} SOS?`}
+        text={`SEND ${typeUpper} SOS?`}
         style={{
           fontSize: 14,
           fontFamily: 'sans-serif-black',
@@ -59,12 +61,11 @@ export function SOSConfirmWidget({ pendingType = 'fire' }) {
         }}
       />
 
-      {/* Action buttons row */}
+      {/* Action buttons row — use margins instead of gap */}
       <FlexWidget
         style={{
           flexDirection: 'row',
           justifyContent: 'center',
-          gap: 12,
           width: 'match_parent',
         }}
       >
@@ -79,11 +80,12 @@ export function SOSConfirmWidget({ pendingType = 'fire' }) {
             padding: 10,
             justifyContent: 'center',
             alignItems: 'center',
+            marginRight: 6,
           }}
           clickAction={`CONFIRM_SOS_${typeUpper}`}
         >
           <TextWidget
-            text="✓ CONFIRM"
+            text="CONFIRM"
             style={{
               fontSize: 11,
               fontFamily: 'sans-serif-black',
@@ -105,11 +107,12 @@ export function SOSConfirmWidget({ pendingType = 'fire' }) {
             padding: 10,
             justifyContent: 'center',
             alignItems: 'center',
+            marginLeft: 6,
           }}
           clickAction="CANCEL_SOS"
         >
           <TextWidget
-            text="✕ CANCEL"
+            text="CANCEL"
             style={{
               fontSize: 11,
               fontFamily: 'sans-serif-black',

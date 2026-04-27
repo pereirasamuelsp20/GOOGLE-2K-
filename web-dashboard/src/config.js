@@ -22,3 +22,9 @@ export const FIREBASE_CONFIG = {
   appId: "1:899786083796:web:2b57ef2b7ce9c2db741a41",
   measurementId: "G-505YGNFQ87"
 };
+
+/**
+ * Gemini API Key
+ * Replace with your real Gemini API key
+ */
+export const GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE";

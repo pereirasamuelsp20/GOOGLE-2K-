@@ -186,7 +186,19 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
         onAuthSuccess(cred.user, false);
       } else {
         const cred = await createUserWithEmailAndPassword(auth, email, password);
-        // would save fullName and role to user profile or DB here
+        // Save user profile — role is limited to Citizen/Volunteer/Responder (no Admin self-signup)
+        try {
+          const { doc, setDoc } = require('firebase/firestore');
+          const { firestore } = require('./firebaseConfig');
+          await setDoc(doc(firestore, 'users', cred.user.uid), {
+            displayName: fullName || email.split('@')[0],
+            email,
+            role,
+            createdAt: new Date(),
+          }, { merge: true });
+        } catch (e) {
+          console.warn('Failed to save user role (non-fatal):', e.message);
+        }
         onAuthSuccess(cred.user, true);
       }
     } catch (err) {
@@ -196,15 +208,28 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
 
   const handleGoogleAuth = async () => {
     try {
-      // Note: signInWithPopup is web-only. 
-      // For a true native app, you'd use expo-auth-session or @react-native-google-signin/google-signin
       if (Platform.OS === 'web') {
         const provider = new GoogleAuthProvider();
         const cred = await signInWithPopup(auth, provider);
-        onAuthSuccess(cred.user, true); // Assuming they are potentially new or we welcome anyway
+        // Create user doc if first time
+        try {
+          const { doc, setDoc, getDoc } = require('firebase/firestore');
+          const { firestore } = require('./firebaseConfig');
+          const userDoc = await getDoc(doc(firestore, 'users', cred.user.uid));
+          if (!userDoc.exists()) {
+            await setDoc(doc(firestore, 'users', cred.user.uid), {
+              displayName: cred.user.displayName || cred.user.email?.split('@')[0] || 'User',
+              email: cred.user.email,
+              role: 'Citizen',
+              createdAt: new Date(),
+            }, { merge: true });
+          }
+        } catch (e) {
+          console.warn('User doc creation failed (non-fatal):', e.message);
+        }
+        onAuthSuccess(cred.user, true);
       } else {
-        // Dummy fallback for native in this demo
-        setErrorMsg('Google Sign-in requires native configuration in this demo.');
+        setErrorMsg('Google Sign-in on mobile requires native configuration (expo-auth-session or @react-native-google-signin). Use email sign-in for now.');
       }
     } catch (err) {
       setErrorMsg(err.message);
@@ -222,7 +247,8 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
     }
   };
 
-  const roles = ['Citizen', 'Volunteer', 'Responder', 'Admin'];
+  // No Admin self-signup — admin can only log in with existing credentials
+  const roles = ['Citizen', 'Volunteer', 'Responder'];
 
   return (
     <View style={styles.container}>

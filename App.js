@@ -2,10 +2,80 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Animated, Easing, Alert, ActivityIndicator, Platform, Linking, NativeModules } from 'react-native';
 import * as Location from 'expo-location';
 import { onAuthStateChanged } from 'firebase/auth';
-import { doc, setDoc, onSnapshot } from 'firebase/firestore';
+import { doc, setDoc, getDoc, onSnapshot } from 'firebase/firestore';
 import { auth, firestore } from './src/firebaseConfig';
-import { MapPin, Flame, Activity as ActivitySquare, ShieldAlert, Wifi, WifiOff, Menu, Map as MapIcon, User, X } from 'lucide-react-native';
+import { MapPin, Flame, Activity as ActivitySquare, ShieldAlert, Wifi, WifiOff, Menu, Map as MapIcon, User, X, MessageCircle, Radio, AlertTriangle, Lock, Users, Stethoscope } from 'lucide-react-native';
 import AuthScreen from './src/AuthScreen';
+import ReportIssueScreen from './src/ReportIssueScreen';
+import ProfileScreen from './src/ProfileScreen';
+import AdminOverviewScreen from './src/AdminOverviewScreen';
+import AdminLiveSOSScreen from './src/AdminLiveSOSScreen';
+import AdminTeamsScreen from './src/AdminTeamsScreen';
+import AdminRespondersScreen from './src/AdminRespondersScreen';
+import AdminVolunteersScreen from './src/AdminVolunteersScreen';
+import { ORS_API_KEY } from './src/orsConfig';
+
+// Role-specific screens (guarded imports)
+let VolunteerRoleScreen = null;
+let TeamScreen = null;
+try { VolunteerRoleScreen = require('./src/VolunteerRoleScreen').default; } catch(e) {}
+try { TeamScreen = require('./src/TeamScreen').default; } catch(e) {}
+
+// API base for backend calls
+const LAN_IP = '10.61.78.188';
+const API_BASE = `http://${LAN_IP}:4000/api`;
+
+// SOS type → facility type mapping
+const SOS_FACILITY_MAP = {
+  'Fire': 'fire_station',
+  'Medical': 'hospital',
+  'Security': 'police',
+  'General': 'police',
+};
+
+// SOS type → vehicle emoji
+const VEHICLE_ICONS = {
+  'Fire': '🚒',
+  'Medical': '🚑',
+  'Security': '🚔',
+  'General': '🚔',
+};
+
+// --- Mesh feature imports (guarded so existing app never crashes) ---
+let MessagesScreen = null;
+let CommunityScreen = null;
+let generateKeyPair = null;
+let hasPrivateKey = null;
+let startBleMeshBackground = null;
+
+try {
+  MessagesScreen = require('./src/MessagesScreen').default;
+} catch (e) {
+  console.warn('MessagesScreen load failed:', e.message);
+}
+
+try {
+  CommunityScreen = require('./src/CommunityScreen').default;
+} catch (e) {
+  console.warn('CommunityScreen load failed:', e.message);
+}
+
+try {
+  const nativeCrypto = require('./src/utils/nativeCrypto');
+  generateKeyPair = nativeCrypto.generateKeyPair;
+  hasPrivateKey = nativeCrypto.hasPrivateKey;
+} catch (e) {
+  console.warn('nativeCrypto load failed:', e.message);
+}
+
+try {
+  const bleMesh = require('./src/utils/BleMesh');
+  startBleMeshBackground = bleMesh.startBleMeshBackground;
+} catch (e) {
+  console.warn('BleMesh load failed:', e.message);
+}
+
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Widget imports — only available on native platforms after prebuild
 let requestWidgetUpdate = null;
@@ -41,18 +111,213 @@ export default function App() {
 
   const [currentScreen, setCurrentScreen] = useState('Home');
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [userRole, setUserRole] = useState('Citizen'); // 'Citizen', 'Volunteer', 'Responder', 'Admin'
+  const [userName, setUserName] = useState('');
+
+  // Dispatch simulation state
+  const [dispatchData, setDispatchData] = useState(null);
+  const dispatchTimersRef = useRef([]);
+  const vehicleIntervalRef = useRef(null);
 
   const glowAnim = useRef(new Animated.Value(1)).current;
   const expandAnim = useRef(new Animated.Value(0)).current;
 
   // 1. Listen for Auth State Changes
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (authUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (authUser) => {
       setUser(authUser);
       setLoading(false);
+
+      if (authUser) {
+        // Initialize Crypto Identity (only if module loaded)
+        try {
+          if (hasPrivateKey && generateKeyPair) {
+            const hasKey = await hasPrivateKey();
+            if (!hasKey) {
+              const pubKey = await generateKeyPair();
+              const deviceCode = Math.random().toString(36).substring(2, 10).toUpperCase();
+              await AsyncStorage.setItem('deviceCode', deviceCode);
+
+              await setDoc(doc(firestore, 'users', authUser.uid), {
+                deviceCode,
+                publicKey: pubKey,
+                email: authUser.email,
+                displayName: authUser.displayName || 'Citizen'
+              }, { merge: true });
+            }
+          }
+        } catch (e) {
+          console.warn('Crypto identity init failed (non-fatal):', e.message);
+        }
+
+        // Start Android BLE Background Mesh (only if module loaded)
+        try {
+          if (startBleMeshBackground) {
+            startBleMeshBackground();
+          }
+        } catch (e) {
+          console.warn('BLE mesh init failed (non-fatal):', e.message);
+        }
+
+        // Real-time listener on user doc for role/name changes
+        if (!authUser.isAnonymous) {
+          try {
+            const userDocRef = doc(firestore, 'users', authUser.uid);
+            const unsubUser = onSnapshot(userDocRef, (snap) => {
+              if (snap.exists()) {
+                const data = snap.data();
+                if (data.role) {
+                  setUserRole(data.role);
+                  if (data.role === 'Responder' && currentScreen === 'Home') setCurrentScreen('Map');
+                  if (data.role === 'Admin' && currentScreen === 'Home') setCurrentScreen('AdminOverview');
+                }
+                setUserName(data.displayName || authUser.displayName || authUser.email?.split('@')[0] || '');
+              } else {
+                setUserName(authUser.displayName || authUser.email?.split('@')[0] || '');
+                // Check responders collection as fallback
+                getDoc(doc(firestore, 'responders', authUser.uid)).then(rDoc => {
+                  if (rDoc.exists() && rDoc.data().role) {
+                    setUserRole('Responder');
+                    setCurrentScreen('Map');
+                  }
+                }).catch(() => {});
+              }
+            });
+            // Store unsub for cleanup
+            return () => { unsubscribe(); unsubUser(); };
+          } catch (e) {
+            console.warn('Role fetch failed (non-fatal):', e.message);
+            setUserName(authUser.displayName || authUser.email?.split('@')[0] || '');
+          }
+        } else {
+          setUserName('Anonymous');
+        }
+      }
     });
     return () => unsubscribe();
   }, []);
+
+  // ── Dispatch Simulation ──
+  const clearDispatch = useCallback(() => {
+    dispatchTimersRef.current.forEach(t => clearTimeout(t));
+    dispatchTimersRef.current = [];
+    if (vehicleIntervalRef.current) {
+      clearInterval(vehicleIntervalRef.current);
+      vehicleIntervalRef.current = null;
+    }
+    setDispatchData(null);
+  }, []);
+
+  const startDispatchSimulation = useCallback(async (sosType, sosId, userLat, userLng) => {
+    const facilityType = SOS_FACILITY_MAP[sosType] || 'police';
+    const vehicleIcon = VEHICLE_ICONS[sosType] || '🚔';
+
+    // 1. Fetch nearest facility
+    let facility;
+    try {
+      const res = await fetch(`${API_BASE}/locations/nearest?lat=${userLat}&lng=${userLng}&type=${facilityType}`);
+      if (res.ok) facility = await res.json();
+    } catch (e) { console.warn('Facility fetch failed:', e.message); }
+
+    if (!facility) {
+      facility = { name: 'Emergency HQ', lat: userLat + 0.015, lng: userLng + 0.012, type: facilityType };
+    }
+
+    // 2. Fetch ORS route from facility → user
+    let routeCoords = [];
+    let totalDistance = 0;
+    let totalDuration = 0;
+    try {
+      const body = { coordinates: [[facility.lng, facility.lat], [userLng, userLat]] };
+      const res = await fetch('https://api.openrouteservice.org/v2/directions/driving-car/geojson', {
+        method: 'POST',
+        headers: { 'Authorization': ORS_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.features && data.features.length > 0) {
+        routeCoords = data.features[0].geometry.coordinates.map(c => [c[1], c[0]]);
+        const summary = data.features[0].properties.summary;
+        totalDistance = summary.distance;
+        totalDuration = summary.duration;
+      }
+    } catch (e) { console.warn('ORS route failed:', e.message); }
+
+    if (routeCoords.length === 0) {
+      routeCoords = [[facility.lat, facility.lng], [userLat, userLng]];
+      totalDistance = 3000;
+      totalDuration = 600;
+    }
+
+    // 3. Schedule "routed" after random 3-8s (faster response)
+    const routedDelay = Math.floor(Math.random() * 5000) + 3000;
+    const t1 = setTimeout(async () => {
+      if (sosId !== 'dummy_path') {
+        try { await setDoc(doc(firestore, 'sos', sosId), { status: 'routed' }, { merge: true }); } catch (e) { }
+      }
+      setStatus('routed');
+
+      setDispatchData({
+        route: routeCoords,
+        vehiclePos: { lat: routeCoords[0][0], lng: routeCoords[0][1] },
+        facilityName: facility.name,
+        facilityType: facility.type,
+        facilityLat: facility.lat,
+        facilityLng: facility.lng,
+        vehicleIcon,
+        eta: Math.ceil(totalDuration / 60) + ' min',
+        progress: 0,
+      });
+
+      // Auto-switch to Map to show the dispatch
+      setCurrentScreen('Map');
+
+      // 4. Schedule "responding" after random 5-15s
+      const respondDelay = Math.floor(Math.random() * 10000) + 5000;
+      const t2 = setTimeout(async () => {
+        if (sosId !== 'dummy_path') {
+          try { await setDoc(doc(firestore, 'sos', sosId), { status: 'responding' }, { merge: true }); } catch (e) { }
+        }
+        setStatus('responding');
+
+        // 5. Start vehicle movement every 15s
+        const trafficMultiplier = 1 + (Math.random() * 0.1 + 0.1);
+        const adjustedDuration = totalDuration * trafficMultiplier;
+        const startTime = Date.now();
+
+        vehicleIntervalRef.current = setInterval(() => {
+          const elapsed = (Date.now() - startTime) / 1000;
+          const progress = Math.min(elapsed / adjustedDuration, 1);
+          const idx = Math.min(Math.floor(progress * (routeCoords.length - 1)), routeCoords.length - 1);
+          const remainingSec = Math.max(0, adjustedDuration - elapsed);
+          const etaMin = Math.ceil(remainingSec / 60);
+
+          setDispatchData(prev => prev ? {
+            ...prev,
+            vehiclePos: { lat: routeCoords[idx][0], lng: routeCoords[idx][1] },
+            eta: etaMin > 0 ? etaMin + ' min' : 'Arriving',
+            progress,
+          } : null);
+
+          if (progress >= 1) {
+            clearInterval(vehicleIntervalRef.current);
+            vehicleIntervalRef.current = null;
+            setTimeout(() => {
+              Alert.alert('Help Arrived', `${facility.name} responder has reached your location.`);
+              if (sosId !== 'dummy_path') {
+                try { setDoc(doc(firestore, 'sos', sosId), { status: 'arrived' }, { merge: true }); } catch (e) { }
+              }
+              setActiveSOSId(null);
+              setStatus(null);
+              clearDispatch();
+            }, 2000);
+          }
+        }, 15000);
+      }, respondDelay);
+      dispatchTimersRef.current.push(t2);
+    }, routedDelay);
+    dispatchTimersRef.current.push(t1);
+  }, [clearDispatch]);
 
   // 1b. Force widget refresh on app launch (Android)
   useEffect(() => {
@@ -161,7 +426,7 @@ export default function App() {
               console.warn("Widget SOS could not retrieve location. Using default.");
               loc = { coords: { latitude: 19.0760, longitude: 72.8777 } };
             }
-            
+
             setLocation(loc.coords);
             setGpsLocked(true);
           }
@@ -204,7 +469,7 @@ export default function App() {
 
   const handleMainButtonPress = () => {
     if (activeSOSId) return;
-    
+
     const nextExpanded = !isExpanded;
     setIsExpanded(nextExpanded);
     Animated.timing(expandAnim, {
@@ -236,7 +501,7 @@ export default function App() {
       const sosId = timestamp.toString();
       const sosRef = doc(firestore, 'sos', sosId);
       await setDoc(sosRef, payload);
-      
+
       setActiveSOSId(sosId);
       setStatus("searching");
       setIsExpanded(false);
@@ -247,29 +512,28 @@ export default function App() {
           setStatus(data.status);
         }
       });
+
+      // Start dispatch simulation
+      startDispatchSimulation(type, sosId, lat, lng);
     } catch (e) {
       console.warn("Widget SOS DB write failed — using demo mode.", e.message);
       setActiveSOSId('dummy_path');
       setStatus("searching");
       setIsExpanded(false);
-      
-      setTimeout(() => setStatus("routed"), 3000);
-      setTimeout(() => setStatus("responding"), 7000);
-      setTimeout(() => {
-        setActiveSOSId(null);
-        setStatus(null);
-        Alert.alert("Demo Over", "Emergency responded successfully.");
-      }, 12000);
+
+      startDispatchSimulation(type, 'dummy_path', lat, lng);
     }
   };
 
   const sendSOS = async (type) => {
     if (!user) return;
-    
+
     const timestamp = Date.now();
     const lat = location ? location.latitude : 0;
     const lng = location ? location.longitude : 0;
-    
+
+    const isAnon = user.isAnonymous || user.uid === 'sys_anonymous' || user.uid?.startsWith('widget_');
+
     const payload = {
       type,
       lat,
@@ -277,14 +541,17 @@ export default function App() {
       status: "searching",
       message: "",
       timestamp,
-      uid: user.uid
+      uid: user.uid,
+      displayName: isAnon ? 'Anonymous' : (user.displayName || user.email?.split('@')[0] || 'User'),
+      email: isAnon ? null : (user.email || null),
+      isAnonymous: isAnon,
     };
 
     try {
       const sosId = timestamp.toString();
       const sosRef = doc(firestore, 'sos', sosId);
       await setDoc(sosRef, payload);
-      
+
       setActiveSOSId(sosId);
       setStatus("searching");
       setIsExpanded(false);
@@ -363,19 +630,15 @@ export default function App() {
           }
         }
       });
+      // Start dispatch simulation
+      startDispatchSimulation(type, sosId, lat, lng);
     } catch (e) {
       console.warn("DB writes failed - placeholder or offline mode active.", e.message);
       setActiveSOSId(`dummy_path`);
       setStatus("searching");
       setIsExpanded(false);
-      
-      setTimeout(() => setStatus("routed"), 3000);
-      setTimeout(() => setStatus("responding"), 7000);
-      setTimeout(() => {
-        setActiveSOSId(null);
-        setStatus(null);
-        Alert.alert("Demo Over", "Emergency responded successfully.");
-      }, 12000);
+
+      startDispatchSimulation(type, 'dummy_path', lat, lng);
     }
   };
 
@@ -385,61 +648,62 @@ export default function App() {
       "Are you sure you want to cancel the SOS request? This action cannot be undone.",
       [
         { text: "No, keep active", style: "cancel" },
-        { 
-          text: "Yes, Cancel", 
-          style: "destructive", 
+        {
+          text: "Yes, Cancel",
+          style: "destructive",
           onPress: async () => {
-             if (activeSOSId !== 'dummy_path') {
-               try {
-                 await setDoc(doc(firestore, 'sos', activeSOSId), { status: 'cancelled' }, { merge: true });
-               } catch (e) { console.log(e); }
-             }
-             setActiveSOSId(null);
-             setStatus(null);
+            if (activeSOSId !== 'dummy_path') {
+              try {
+                await setDoc(doc(firestore, 'sos', activeSOSId), { status: 'cancelled' }, { merge: true });
+              } catch (e) { console.log(e); }
+            }
+            setActiveSOSId(null);
+            setStatus(null);
+            clearDispatch();
 
-             // Write SOS cancelled state to iOS shared UserDefaults
-             if (Platform.OS === 'ios' && NativeModules.SharedDefaults) {
-               try {
-                 const sharedState = JSON.stringify({
-                   gpsLocked: gpsLocked,
-                   lat: location ? location.latitude : 0,
-                   lng: location ? location.longitude : 0,
-                   uid: user?.uid ?? 'anonymous',
-                   lastUpdated: Date.now(),
-                   sosActive: false,
-                   activeType: null,
-                   status: null,
-                 });
-                 await NativeModules.SharedDefaults.setItem('widgetState', sharedState);
-               } catch (e) {
-                 console.warn('Failed to clear widget SOS state:', e.message);
-               }
-             }
+            // Write SOS cancelled state to iOS shared UserDefaults
+            if (Platform.OS === 'ios' && NativeModules.SharedDefaults) {
+              try {
+                const sharedState = JSON.stringify({
+                  gpsLocked: gpsLocked,
+                  lat: location ? location.latitude : 0,
+                  lng: location ? location.longitude : 0,
+                  uid: user?.uid ?? 'anonymous',
+                  lastUpdated: Date.now(),
+                  sosActive: false,
+                  activeType: null,
+                  status: null,
+                });
+                await NativeModules.SharedDefaults.setItem('widgetState', sharedState);
+              } catch (e) {
+                console.warn('Failed to clear widget SOS state:', e.message);
+              }
+            }
 
-             // Revert Android widget to idle state
-             if (Platform.OS === 'android' && requestWidgetUpdate && SOSWidgetComponent) {
-               try {
-                 await requestWidgetUpdate({
-                   widgetName: 'SOSWidget',
-                   renderWidget: () => {
-                     const Widget = SOSWidgetComponent;
-                     return <Widget gpsStatus={gpsLocked ? 'locked' : 'searching'} sosActive={false} />;
-                   },
-                 });
-               } catch (e) {
-                 console.warn('Widget reset failed:', e.message);
-               }
-             }
+            // Revert Android widget to idle state
+            if (Platform.OS === 'android' && requestWidgetUpdate && SOSWidgetComponent) {
+              try {
+                await requestWidgetUpdate({
+                  widgetName: 'SOSWidget',
+                  renderWidget: () => {
+                    const Widget = SOSWidgetComponent;
+                    return <Widget gpsStatus={gpsLocked ? 'locked' : 'searching'} sosActive={false} />;
+                  },
+                });
+              } catch (e) {
+                console.warn('Widget reset failed:', e.message);
+              }
+            }
 
-             // Reload iOS WidgetKit timeline
-             if (Platform.OS === 'ios' && NativeModules.WidgetKitBridge) {
-               try {
-                 NativeModules.WidgetKitBridge.reloadAllTimelines();
-               } catch (e) {
-                 console.warn('WidgetKit reload failed:', e.message);
-               }
-             }
-          } 
+            // Reload iOS WidgetKit timeline
+            if (Platform.OS === 'ios' && NativeModules.WidgetKitBridge) {
+              try {
+                NativeModules.WidgetKitBridge.reloadAllTimelines();
+              } catch (e) {
+                console.warn('WidgetKit reload failed:', e.message);
+              }
+            }
+          }
         }
       ]
     );
@@ -448,20 +712,27 @@ export default function App() {
   if (loading) {
     return (
       <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
-        <ActivityIndicator size="large" color="#dc2626" />
+        <Animated.View style={{ alignItems: 'center', transform: [{ scale: glowAnim }] }}>
+          <View style={{ width: 64, height: 64, backgroundColor: '#dc2626', borderRadius: 16, justifyContent: 'center', alignItems: 'center', marginBottom: 18, shadowColor: '#dc2626', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 14, elevation: 8 }}>
+            <Flame color="#fff" size={30} />
+          </View>
+        </Animated.View>
+        <Text style={{ color: '#fff', fontSize: 22, fontWeight: '700', letterSpacing: -0.5, marginBottom: 4 }}>ReliefMesh</Text>
+        <Text style={{ color: '#555', fontSize: 11, letterSpacing: 2, fontWeight: '600', marginBottom: 28 }}>EMERGENCY RESPONSE</Text>
+        <ActivityIndicator size="small" color="#dc2626" />
       </View>
     );
   }
 
   if (!user) {
-    return <AuthScreen 
+    return <AuthScreen
       onAuthSuccess={(u, isNew) => {
         setUser(u);
         if (isNew) {
           setTimeout(() => Alert.alert("Welcome to ReliefMesh!", "We're glad you joined the network."), 500);
         }
-      }} 
-      onSkipAuth={() => setUser({ uid: 'sys_anonymous', isAnonymous: true })} 
+      }}
+      onSkipAuth={() => setUser({ uid: 'sys_anonymous', isAnonymous: true })}
     />;
   }
 
@@ -478,14 +749,20 @@ export default function App() {
     <View style={styles.container}>
       {/* Header */}
       <View style={{ ...styles.headerContainer, zIndex: 10 }}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12, flex: 1, minWidth: 0 }}>
           <TouchableOpacity onPress={() => setIsMenuOpen(true)}>
             <Menu color="#fff" size={28} />
           </TouchableOpacity>
-          <View>
-            <Text style={styles.title}>SOS</Text>
-            <Text style={styles.subtitle}>EMERGENCY RESPONSE</Text>
-            <Text style={styles.uid}>UID: {user.uid.substring(0, 12)}...</Text>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.title}>ReliefMesh</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
+              <Text style={{ color: '#ccc', fontSize: 13, fontWeight: '600' }} numberOfLines={1}>
+                {userName || (user.isAnonymous ? 'Anonymous' : 'User')}
+              </Text>
+              <View style={{ backgroundColor: ({ Admin: '#dc2626', Responder: '#3b82f6', Volunteer: '#f59e0b', Citizen: '#22c55e' }[userRole] || '#6b7280') + '22', borderWidth: 1, borderColor: ({ Admin: '#dc2626', Responder: '#3b82f6', Volunteer: '#f59e0b', Citizen: '#22c55e' }[userRole] || '#6b7280'), paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10 }}>
+                <Text style={{ color: ({ Admin: '#dc2626', Responder: '#3b82f6', Volunteer: '#f59e0b', Citizen: '#22c55e' }[userRole] || '#6b7280'), fontSize: 9, fontWeight: '700', letterSpacing: 1, textTransform: 'uppercase' }}>{userRole}</Text>
+              </View>
+            </View>
           </View>
         </View>
         <View style={styles.gpsContainer}>
@@ -503,12 +780,12 @@ export default function App() {
           <View style={styles.centerArea}>
             <Animated.View style={[styles.glowRing1, { transform: [{ scale: glowAnim }] }]} />
             <Animated.View style={[styles.glowRing2, { transform: [{ scale: glowAnim }] }]} />
-            
-            <TouchableOpacity 
+
+            <TouchableOpacity
               activeOpacity={0.85}
               onPress={handleMainButtonPress}
               style={[styles.mainButton, activeSOSId && styles.mainButtonActive]}
-              disabled={!!activeSOSId} 
+              disabled={!!activeSOSId}
             >
               <Text style={[styles.mainButtonText, activeSOSId && styles.mainButtonTextActive]}>
                 SOS
@@ -518,10 +795,10 @@ export default function App() {
 
           {/* Expanded Emergency Options */}
           {(!activeSOSId) && (
-            <Animated.View 
+            <Animated.View
               {...Platform.select({ web: {}, default: { pointerEvents: isExpanded ? 'auto' : 'none' } })}
-              style={[styles.optionsContainer, { 
-                opacity: optionsOpacity, 
+              style={[styles.optionsContainer, {
+                opacity: optionsOpacity,
                 transform: [{ translateY: optionsTranslateY }],
                 ...(Platform.OS === 'web' ? { pointerEvents: isExpanded ? 'auto' : 'none' } : {})
               }]}
@@ -571,7 +848,7 @@ export default function App() {
           {Platform.OS === 'web' && WebMapComponent ? (
             <WebMapComponent userLoc={location} />
           ) : NativeMapComponent ? (
-            <NativeMapComponent userLoc={location} />
+            <NativeMapComponent userLoc={location} dispatchData={dispatchData} />
           ) : (
             <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: 30 }}>
               <Text style={{ color: '#fff', fontSize: 28, fontWeight: '700', marginBottom: 12 }}>Citizen Map</Text>
@@ -584,30 +861,58 @@ export default function App() {
       )}
 
       {currentScreen === 'Profile' && (
-        <View style={{ flex: 1, padding: 20, marginTop: 30 }}>
-          <Text style={{ color: '#fff', fontSize: 32, fontWeight: '900', letterSpacing: -1 }}>Profile</Text>
-          
-          <View style={{ marginTop: 30, backgroundColor: '#131313', padding: 20, borderRadius: 12, borderWidth: 1, borderColor: '#222' }}>
-             <Text style={{ color: '#888', fontSize: 12, fontWeight: '700', letterSpacing: 1.5, marginBottom: 8 }}>USER IDENTIFIER</Text>
-             <Text style={{ color: '#fff', fontSize: 16 }}>{user.uid}</Text>
-             
-             <Text style={{ color: '#888', fontSize: 12, fontWeight: '700', letterSpacing: 1.5, marginTop: 24, marginBottom: 8 }}>ACCOUNT TYPE</Text>
-             <Text style={{ color: '#fff', fontSize: 16 }}>{user.isAnonymous ? 'Anonymous Citizen' : 'Registered Member'}</Text>
-          </View>
-
-          <TouchableOpacity style={{ marginTop: 40, backgroundColor: 'rgba(255, 59, 48, 0.1)', borderWidth: 1, borderColor: 'rgba(255, 59, 48, 0.3)', padding: 16, borderRadius: 10, alignItems: 'center' }} onPress={() => auth.signOut()}>
-             <Text style={{ color: '#FF3B30', fontWeight: '800', letterSpacing: 1 }}>SIGN OUT securely</Text>
-          </TouchableOpacity>
-        </View>
+        <ProfileScreen
+          user={user}
+          userRole={userRole}
+          userName={userName}
+          onSignOut={() => { setUser(null); setUserRole('Citizen'); setUserName(''); }}
+          onNavigateToAuth={() => { setUser(null); }}
+        />
       )}
+
+      {currentScreen === 'Report' && (
+        <ReportIssueScreen />
+      )}
+
+      {currentScreen === 'VolunteerRole' && VolunteerRoleScreen && (
+        <VolunteerRoleScreen />
+      )}
+
+      {currentScreen === 'Team' && TeamScreen && (
+        <TeamScreen />
+      )}
+
+      {currentScreen === 'Messages' && (() => {
+        const isAnon = !user || user.isAnonymous || user.uid === 'sys_anonymous' || user.uid?.startsWith('widget_');
+        if (isAnon) {
+          return (
+            <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 40 }}>
+              <Lock color="#555" size={48} />
+              <Text style={{ color: '#fff', fontSize: 20, fontWeight: '800', marginTop: 20, marginBottom: 8 }}>Chat Locked</Text>
+              <Text style={{ color: '#888', fontSize: 14, textAlign: 'center', lineHeight: 20 }}>
+                Sign in with an account to use encrypted messaging. Anonymous users cannot access chat.
+              </Text>
+            </View>
+          );
+        }
+        return MessagesScreen ? <MessagesScreen /> : <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}><Text style={{ color: '#888' }}>Messages loading...</Text></View>;
+      })()}
+      {currentScreen === 'Community' && (CommunityScreen ? <CommunityScreen /> : <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}><Text style={{ color: '#888' }}>Community feature loading...</Text></View>)}
+
+      {/* Admin Screens */}
+      {currentScreen === 'AdminOverview' && <AdminOverviewScreen />}
+      {currentScreen === 'AdminLiveSOS' && <AdminLiveSOSScreen />}
+      {currentScreen === 'AdminTeams' && <AdminTeamsScreen />}
+      {currentScreen === 'AdminResponders' && <AdminRespondersScreen />}
+      {currentScreen === 'AdminVolunteers' && <AdminVolunteersScreen />}
 
       {/* Drawer Overlay */}
       {isMenuOpen && (
         <View style={[StyleSheet.absoluteFill, { zIndex: 999, elevation: 999 }]}>
-          <TouchableOpacity 
-            style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.7)' }} 
-            activeOpacity={1} 
-            onPress={() => setIsMenuOpen(false)} 
+          <TouchableOpacity
+            style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.7)' }}
+            activeOpacity={1}
+            onPress={() => setIsMenuOpen(false)}
           />
           <View style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: 280, backgroundColor: '#0f0f0f', borderRightWidth: 1, borderRightColor: '#222', padding: 24, paddingTop: 60 }}>
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 40 }}>
@@ -617,20 +922,101 @@ export default function App() {
               </TouchableOpacity>
             </View>
 
-            <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Home'); setIsMenuOpen(false); }}>
-              <Flame color={currentScreen === 'Home' ? '#FF3B30' : '#888'} size={24} />
-              <Text style={{ color: currentScreen === 'Home' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>SOS Core</Text>
-            </TouchableOpacity>
+            {userRole === 'Admin' ? (
+              <>
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('AdminOverview'); setIsMenuOpen(false); }}>
+                  <ActivitySquare color={currentScreen === 'AdminOverview' ? '#dc2626' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'AdminOverview' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Admin Console</Text>
+                </TouchableOpacity>
 
-            <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Map'); setIsMenuOpen(false); }}>
-              <MapIcon color={currentScreen === 'Map' ? '#FF3B30' : '#888'} size={24} />
-              <Text style={{ color: currentScreen === 'Map' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Mesh Map</Text>
-            </TouchableOpacity>
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Map'); setIsMenuOpen(false); }}>
+                  <MapIcon color={currentScreen === 'Map' ? '#dc2626' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'Map' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Mesh Map</Text>
+                </TouchableOpacity>
 
-            <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Profile'); setIsMenuOpen(false); }}>
-              <User color={currentScreen === 'Profile' ? '#FF3B30' : '#888'} size={24} />
-              <Text style={{ color: currentScreen === 'Profile' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>My Profile</Text>
-            </TouchableOpacity>
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('AdminLiveSOS'); setIsMenuOpen(false); }}>
+                  <AlertTriangle color={currentScreen === 'AdminLiveSOS' ? '#dc2626' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'AdminLiveSOS' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Live SOS Alerts</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('AdminTeams'); setIsMenuOpen(false); }}>
+                  <Users color={currentScreen === 'AdminTeams' ? '#dc2626' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'AdminTeams' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Manage Teams</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('AdminVolunteers'); setIsMenuOpen(false); }}>
+                  <Stethoscope color={currentScreen === 'AdminVolunteers' ? '#dc2626' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'AdminVolunteers' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Volunteers</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('AdminResponders'); setIsMenuOpen(false); }}>
+                  <ShieldAlert color={currentScreen === 'AdminResponders' ? '#dc2626' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'AdminResponders' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Responders</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Profile'); setIsMenuOpen(false); }}>
+                  <User color={currentScreen === 'Profile' ? '#dc2626' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'Profile' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Admin Profile</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <>
+                {/* SOS Core — hidden for Responders */}
+                {userRole !== 'Responder' && (
+                  <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Home'); setIsMenuOpen(false); }}>
+                    <Flame color={currentScreen === 'Home' ? '#FF3B30' : '#888'} size={24} />
+                    <Text style={{ color: currentScreen === 'Home' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>SOS Core</Text>
+                  </TouchableOpacity>
+                )}
+
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Map'); setIsMenuOpen(false); }}>
+                  <MapIcon color={currentScreen === 'Map' ? '#FF3B30' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'Map' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Mesh Map</Text>
+                </TouchableOpacity>
+
+                {/* Chat — show lock for anonymous */}
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Messages'); setIsMenuOpen(false); }}>
+                  {(user?.isAnonymous || user?.uid === 'sys_anonymous') ? (
+                    <Lock color="#555" size={24} />
+                  ) : (
+                    <MessageCircle color={currentScreen === 'Messages' ? '#FF3B30' : '#888'} size={24} />
+                  )}
+                  <Text style={{ color: (user?.isAnonymous || user?.uid === 'sys_anonymous') ? '#555' : (currentScreen === 'Messages' ? '#fff' : '#aaa'), fontSize: 16, fontWeight: '700' }}>Chat</Text>
+                  {(user?.isAnonymous || user?.uid === 'sys_anonymous') && <Lock color="#444" size={12} />}
+                </TouchableOpacity>
+
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Community'); setIsMenuOpen(false); }}>
+                  <Radio color={currentScreen === 'Community' ? '#FF3B30' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'Community' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Community Feed</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Report'); setIsMenuOpen(false); }}>
+                  <AlertTriangle color={currentScreen === 'Report' ? '#FF3B30' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'Report' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Report an Issue</Text>
+                </TouchableOpacity>
+
+                {/* Volunteer Role — only for Volunteers */}
+                {userRole === 'Volunteer' && (
+                  <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('VolunteerRole'); setIsMenuOpen(false); }}>
+                    <Stethoscope color={currentScreen === 'VolunteerRole' ? '#FF3B30' : '#f59e0b'} size={24} />
+                    <Text style={{ color: currentScreen === 'VolunteerRole' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Select Role</Text>
+                  </TouchableOpacity>
+                )}
+
+                {/* My Team — only for Responders */}
+                {userRole === 'Responder' && (
+                  <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Team'); setIsMenuOpen(false); }}>
+                    <Users color={currentScreen === 'Team' ? '#FF3B30' : '#3b82f6'} size={24} />
+                    <Text style={{ color: currentScreen === 'Team' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>My Team</Text>
+                  </TouchableOpacity>
+                )}
+
+                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('Profile'); setIsMenuOpen(false); }}>
+                  <User color={currentScreen === 'Profile' ? '#FF3B30' : '#888'} size={24} />
+                  <Text style={{ color: currentScreen === 'Profile' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>My Profile</Text>
+                </TouchableOpacity>
+              </>
+            )}
           </View>
         </View>
       )}
@@ -641,10 +1027,10 @@ export default function App() {
 const Step = ({ indicator, currentStatus }) => {
   const isActive = currentStatus === indicator.toLowerCase();
   const indexMap = { 'searching': 0, 'routed': 1, 'responding': 2 };
-  
+
   const currentIdx = indexMap[currentStatus?.toLowerCase()] ?? -1;
   const stepIdx = indexMap[indicator.toLowerCase()];
-  
+
   const isPast = stepIdx <= currentIdx;
 
   return (
@@ -665,27 +1051,13 @@ const styles = StyleSheet.create({
   headerContainer: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'flex-start',
+    alignItems: 'center',
   },
   title: {
     color: '#fff',
-    fontSize: 28,
+    fontSize: 22,
     fontWeight: '900',
-    letterSpacing: -1,
-  },
-  subtitle: {
-    color: '#888',
-    fontSize: 10,
-    letterSpacing: 2,
-    marginTop: 4,
-    fontWeight: '600'
-  },
-  uid: {
-    color: '#333',
-    fontSize: 10,
-    marginTop: 20,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    letterSpacing: 1
+    letterSpacing: -0.5,
   },
   gpsContainer: {
     flexDirection: 'row',
@@ -872,4 +1244,3 @@ const styles = StyleSheet.create({
     letterSpacing: 2,
   }
 });
-

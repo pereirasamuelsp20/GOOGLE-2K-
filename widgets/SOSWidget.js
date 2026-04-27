@@ -3,6 +3,7 @@
 // Tapping triggers a general SOS without login.
 // Only FlexWidget, TextWidget, ImageWidget, ListWidget are available.
 // NO hooks, NO state, NO async. Pure declarative render.
+// IMPORTANT: Android widgets do NOT support rgba() colors — use hex only.
 
 import React from 'react';
 import {
@@ -17,8 +18,12 @@ import {
  * @param {boolean} props.sosActive - Whether an SOS is currently dispatched
  * @param {string} props.activeType - 'fire' | 'medical' | 'security' | 'general' | null
  */
-export function SOSWidget({ sosActive = false, activeType = null }) {
-  if (sosActive) {
+export function SOSWidget({ sosActive, activeType }) {
+  // Normalize props — widget rendering can pass undefined
+  const isActive = sosActive === true;
+  const type = activeType || 'emergency';
+
+  if (isActive) {
     // ACTIVE STATE — red alert banner
     return (
       <FlexWidget
@@ -30,11 +35,12 @@ export function SOSWidget({ sosActive = false, activeType = null }) {
           alignItems: 'center',
           backgroundColor: '#3A0000',
           borderRadius: 20,
+          padding: 16,
         }}
         clickAction="OPEN_APP"
       >
         <TextWidget
-          text="🚨 SOS ACTIVE"
+          text="SOS ACTIVE"
           style={{
             fontSize: 18,
             fontFamily: 'sans-serif-black',
@@ -43,7 +49,7 @@ export function SOSWidget({ sosActive = false, activeType = null }) {
           }}
         />
         <TextWidget
-          text={activeType ? activeType.toUpperCase() : 'EMERGENCY'}
+          text={type.toUpperCase()}
           style={{
             fontSize: 12,
             fontFamily: 'sans-serif',
@@ -54,7 +60,7 @@ export function SOSWidget({ sosActive = false, activeType = null }) {
           }}
         />
         <TextWidget
-          text="TAP TO TRACK STATUS →"
+          text="TAP TO TRACK STATUS"
           style={{
             fontSize: 10,
             color: '#6A2222',
@@ -67,7 +73,7 @@ export function SOSWidget({ sosActive = false, activeType = null }) {
     );
   }
 
-  // DEFAULT STATE — Large red SOS button with glow rings matching iOS precisely
+  // DEFAULT STATE — Large red SOS button with concentric ring design
   return (
     <FlexWidget
       style={{
@@ -78,21 +84,22 @@ export function SOSWidget({ sosActive = false, activeType = null }) {
         alignItems: 'center',
         backgroundColor: '#0A0A0A',
         borderRadius: 20,
+        padding: 8,
       }}
       clickAction="OPEN_URI"
       clickActionData={{ uri: 'reliefmesh://sos?type=general' }}
     >
-      {/* Outer ring */}
+      {/* Outer ring — use solid hex, no rgba */}
       <FlexWidget
         style={{
           width: 110,
           height: 110,
           borderRadius: 55,
           borderWidth: 2,
-          borderColor: 'rgba(255, 59, 48, 0.12)',
+          borderColor: '#1F0808',
           justifyContent: 'center',
           alignItems: 'center',
-          backgroundColor: '#00000000',
+          backgroundColor: '#0A0A0A',
         }}
       >
         {/* Inner ring */}
@@ -102,10 +109,10 @@ export function SOSWidget({ sosActive = false, activeType = null }) {
             height: 80,
             borderRadius: 40,
             borderWidth: 2,
-            borderColor: 'rgba(255, 59, 48, 0.18)',
+            borderColor: '#2E0F0F',
             justifyContent: 'center',
             alignItems: 'center',
-            backgroundColor: '#00000000',
+            backgroundColor: '#0A0A0A',
           }}
         >
           {/* Red SOS Button */}
@@ -132,6 +139,18 @@ export function SOSWidget({ sosActive = false, activeType = null }) {
           </FlexWidget>
         </FlexWidget>
       </FlexWidget>
+
+      {/* Label under rings */}
+      <TextWidget
+        text="TAP FOR EMERGENCY"
+        style={{
+          fontSize: 8,
+          color: '#444444',
+          textAlign: 'center',
+          marginTop: 6,
+          letterSpacing: 2,
+        }}
+      />
     </FlexWidget>
   );
 }
