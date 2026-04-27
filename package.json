@@ -1,0 +1,18 @@
+{
+  "name": "reliefmesh-website",
+  "version": "1.0.0",
+  "description": "ReliefMesh Emergency Response Platform – Web Dashboard & Backend API",
+  "private": true,
+  "scripts": {
+    "install:all": "cd frontend && npm install && cd ../backend && npm install",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && npm start",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "build": "cd frontend && npm run build",
+    "start": "cd backend && node index.js",
+    "deploy": "npm run build && npm start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
