@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const path = require('path');
 require('dotenv').config();
 
 const reportsRouter = require('./routes/reports');
@@ -24,19 +23,11 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-// ── Production: serve the built frontend ──
-// After running `npm run build` in the frontend folder, the compiled
-// static files live in ../frontend/dist.  In production the Express
-// server serves them so you only need a single process.
-const frontendDist = path.join(__dirname, '..', 'frontend', 'dist');
-app.use(express.static(frontendDist));
-
-// For any non-API route, send back index.html (SPA client-side routing)
-app.get(/^\/(?!api).*/, (_req, res) => {
-  res.sendFile(path.join(frontendDist, 'index.html'));
+// Root route
+app.get('/', (_req, res) => {
+  res.send('SOS Backend is running');
 });
 
-// Connect to MongoDB then start server (with automatic local fallback)
 const LOCAL_MONGO = 'mongodb://127.0.0.1:27017/sos_reports';
 
 async function connectDB() {
@@ -44,7 +35,7 @@ async function connectDB() {
     await mongoose.connect(MONGO_URI);
     console.log('✅ Connected to MongoDB:', MONGO_URI.includes('mongodb+srv') ? 'Atlas (cloud)' : 'Local');
   } catch (err) {
-    console.warn('⚠️  Primary MongoDB failed:', err.message);
+    console.warn('⚠️ Primary MongoDB failed:', err.message);
     if (MONGO_URI !== LOCAL_MONGO) {
       console.log('🔄 Falling back to local MongoDB...');
       try {
@@ -63,7 +54,6 @@ async function connectDB() {
 
 connectDB().then(() => {
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Backend server running on http://0.0.0.0:${PORT}`);
-    console.log(`📱 Mobile devices: connect to http://<your-ip>:${PORT}`);
+    console.log(`🚀 Backend server running on port ${PORT}`);
   });
 });
