@@ -194,6 +194,11 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
         const cred = await signInWithEmailAndPassword(auth, email, password);
         onAuthSuccess(cred.user, false);
       } else {
+        // Task 2: Phone number is required for sign up
+        if (!phoneNumber || phoneNumber.replace(/\D/g, '').length < 10) {
+          setErrorMsg('Phone number is required. Please enter a valid 10-digit number.');
+          return;
+        }
         const cred = await createUserWithEmailAndPassword(auth, email, password);
         // Save user profile with phone number
         try {
@@ -395,10 +400,10 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
               </View>
             )}
 
-            {/* BUG 2: Phone number input (Sign Up only) */}
+            {/* Phone number input (Sign Up only — required) */}
             {activeTab === 'Sign up' && (
               <View style={styles.inputGroup}>
-                <Text style={styles.label}>Phone number <Text style={{ color: '#555', fontSize: 11 }}>(optional)</Text></Text>
+                <Text style={styles.label}>Phone number <Text style={{ color: '#dc2626', fontSize: 11, fontWeight: '700' }}>(required *)</Text></Text>
                 <TextInput
                   style={styles.input}
                   placeholder="+91 XXXXX XXXXX"
@@ -406,6 +411,8 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
                   keyboardType="phone-pad"
                   value={phoneNumber}
                   onChangeText={setPhoneNumber}
+                  textContentType="telephoneNumber"
+                  autoComplete="tel"
                 />
               </View>
             )}
@@ -455,7 +462,7 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
 
       </View>
 
-      {/* BUG 2: OTP Verification Modal */}
+      {/* OTP Verification Modal */}
       {showOtpModal && (
         <View style={styles.otpOverlay}>
           <View style={styles.otpCard}>
@@ -471,7 +478,16 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
               keyboardType="number-pad"
               maxLength={6}
               value={otpCode}
-              onChangeText={setOtpCode}
+              onChangeText={(code) => {
+                setOtpCode(code);
+                // Task 5: Auto-submit when 6 digits are entered
+                if (code.length === 6) {
+                  setTimeout(() => handleVerifyOtp(), 300);
+                }
+              }}
+              textContentType="oneTimeCode"
+              autoComplete="sms-otp"
+              autoFocus={true}
             />
             <View style={{ marginTop: 16 }}>
               <AnimatedButton title="Verify" onPress={handleVerifyOtp} type="primary" />

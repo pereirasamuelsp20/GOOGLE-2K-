@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, FlatList, TouchableOpacity, TextInput, Alert, Modal } from 'react-native';
 import { auth, firestore } from './firebaseConfig';
-import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, doc, getDoc } from 'firebase/firestore';
+import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, doc, getDoc, deleteDoc } from 'firebase/firestore';
 import { hashSignature, verifySignature } from './utils/nativeCrypto';
-import { ShieldAlert, ShieldCheck, Plus, X } from 'lucide-react-native';
+import { ShieldAlert, ShieldCheck, Plus, X, Trash2 } from 'lucide-react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Activity icon was renamed in some lucide versions — use safe fallback
@@ -45,12 +45,41 @@ export default function CommunityScreen() {
     return () => unsub();
   }, []);
 
-  const renderPost = ({ item }) => (
+  const handleDeletePost = (postId) => {
+    Alert.alert(
+      'Delete Post',
+      'Are you sure you want to delete this post?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete', style: 'destructive',
+          onPress: async () => {
+            try {
+              await deleteDoc(doc(firestore, `channels/${GLOBAL_CHANNEL}/posts`, postId));
+            } catch (e) {
+              Alert.alert('Error', 'Failed to delete post.');
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  const renderPost = ({ item }) => {
+    const canDelete = currentUser && (item.adminUid === currentUser.uid || isAdmin);
+    return (
     <View style={[styles.postCard, item.urgent && styles.urgentCard]}>
       {item.urgent && <Text style={styles.urgentBadge}>URGENT</Text>}
       <View style={styles.postHeader}>
-        <Text style={styles.adminName}>{item.adminName || 'Admin'}</Text>
-        {item.verified ? <ShieldCheck color="#10b981" size={16} /> : <ShieldAlert color="#ef4444" size={16} />}
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 }}>
+          <Text style={styles.adminName}>{item.adminName || 'Admin'}</Text>
+          {item.verified ? <ShieldCheck color="#10b981" size={16} /> : <ShieldAlert color="#ef4444" size={16} />}
+        </View>
+        {canDelete && (
+          <TouchableOpacity onPress={() => handleDeletePost(item.id)} style={{ padding: 4 }}>
+            <Trash2 color="#666" size={16} />
+          </TouchableOpacity>
+        )}
       </View>
       <Text style={styles.postContent}>{item.content}</Text>
       {item.tags && (
@@ -60,6 +89,7 @@ export default function CommunityScreen() {
       )}
     </View>
   );
+  };
 
   return (
     <View style={styles.container}>

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Alert, Platform, Dimensions } from 'react-native';
-import { collection, onSnapshot, query, where, doc, updateDoc } from 'firebase/firestore';
-import { ref, onValue, update } from 'firebase/database';
+import { collection, onSnapshot, query, where, doc, updateDoc, getDocs } from 'firebase/firestore';
+import { ref, onValue, update, remove } from 'firebase/database';
 import { firestore, database as rtdb } from './firebaseConfig';
 import { Radio, Truck, MapPin, Clock, Users } from 'lucide-react-native';
 import { WebView } from 'react-native-webview';
@@ -62,6 +62,37 @@ export default function AdminLiveSOSScreen() {
     } catch (e) {
       Alert.alert('Error', 'Dispatch failed: ' + e.message);
     }
+  };
+
+  const handleCancelSOS = (sos) => {
+    Alert.alert(
+      'Cancel SOS',
+      `Cancel SOS #${sos.id.substring(0,10)}? This will reset the assigned team.`,
+      [
+        { text: 'No', style: 'cancel' },
+        {
+          text: 'Yes, Cancel', style: 'destructive',
+          onPress: async () => {
+            try {
+              await update(ref(rtdb, `sos/${sos.id}`), { status: 'cancelled' });
+              try { await remove(ref(rtdb, `dispatch/${sos.id}`)); } catch(e) {}
+              if (sos.teamId) {
+                try { await updateDoc(doc(firestore, 'teams', sos.teamId), { status: 'ready', dispatchedSosId: null }); } catch(e) {}
+              }
+              // Also find any team dispatched to this SOS
+              try {
+                const teamSnap = await getDocs(query(collection(firestore, 'teams'), where('dispatchedSosId', '==', sos.id)));
+                teamSnap.forEach(async (d) => {
+                  await updateDoc(doc(firestore, 'teams', d.id), { status: 'ready', dispatchedSosId: null });
+                });
+              } catch(e) {}
+            } catch (e) {
+              Alert.alert('Error', 'Cancel failed: ' + e.message);
+            }
+          }
+        }
+      ]
+    );
   };
 
   const getStatusStyle = (status) => {
@@ -241,11 +272,19 @@ function handleMsg(raw){
             {(sos.status === 'routed' || sos.status === 'responding') && sos.teamId && (
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: 'rgba(59,130,246,0.06)', padding: 10, borderRadius: 8 }}>
                 <Truck color="#3b82f6" size={14} />
-                <Text style={{ color: '#3b82f6', fontSize: 13, fontWeight: '600' }}>
+                <Text style={{ color: '#3b82f6', fontSize: 13, fontWeight: '600', flex: 1 }}>
                   Team dispatched — {sos.status === 'responding' ? 'En route' : 'Route calculated'}
                 </Text>
               </View>
             )}
+
+            {/* Cancel SOS Button */}
+            <TouchableOpacity
+              style={{ marginTop: 10, padding: 10, borderRadius: 8, borderWidth: 1, borderColor: 'rgba(220,38,38,0.3)', backgroundColor: 'rgba(220,38,38,0.06)', alignItems: 'center' }}
+              onPress={() => handleCancelSOS(sos)}
+            >
+              <Text style={{ color: '#dc2626', fontSize: 12, fontWeight: '700' }}>Cancel SOS</Text>
+            </TouchableOpacity>
           </View>
         );
       })}

@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Animated, Easing, Alert, ActivityIndicator, Platform, Linking, NativeModules } from 'react-native';
 import * as Location from 'expo-location';
 import { onAuthStateChanged } from 'firebase/auth';
-import { doc, setDoc, getDoc, onSnapshot } from 'firebase/firestore';
-import { auth, firestore } from './src/firebaseConfig';
+import { doc, setDoc, getDoc, onSnapshot, collection, query, where, getDocs, updateDoc } from 'firebase/firestore';
+import { auth, firestore, database as rtdb } from './src/firebaseConfig';
+import { ref, set, update as rtdbUpdate, remove } from 'firebase/database';
 import { MapPin, Flame, Activity as ActivitySquare, ShieldAlert, Wifi, WifiOff, Menu, Map as MapIcon, User, X, MessageCircle, Radio, AlertTriangle, Lock, Users, Stethoscope } from 'lucide-react-native';
 import AuthScreen from './src/AuthScreen';
 import ReportIssueScreen from './src/ReportIssueScreen';
@@ -254,10 +255,11 @@ export default function App() {
     const t1 = setTimeout(async () => {
       if (sosId !== 'dummy_path') {
         try { await setDoc(doc(firestore, 'sos', sosId), { status: 'routed' }, { merge: true }); } catch (e) { }
+        try { await rtdbUpdate(ref(rtdb, 'sos/' + sosId), { status: 'routed' }); } catch(e) {}
       }
       setStatus('routed');
 
-      setDispatchData({
+      const dispatchPayload = {
         route: routeCoords,
         vehiclePos: { lat: routeCoords[0][0], lng: routeCoords[0][1] },
         facilityName: facility.name,
@@ -267,7 +269,15 @@ export default function App() {
         vehicleIcon,
         eta: Math.ceil(totalDuration / 60) + ' min',
         progress: 0,
-      });
+        sosId,
+        sosType,
+        timestamp: Date.now(),
+      };
+      setDispatchData(dispatchPayload);
+      // Write dispatch data to RTDB so admin can track vehicles
+      if (sosId !== 'dummy_path') {
+        try { await set(ref(rtdb, 'dispatch/' + sosId), dispatchPayload); } catch(e) {}
+      }
 
       // Auto-switch to Map to show the dispatch
       setCurrentScreen('Map');
@@ -277,6 +287,7 @@ export default function App() {
       const t2 = setTimeout(async () => {
         if (sosId !== 'dummy_path') {
           try { await setDoc(doc(firestore, 'sos', sosId), { status: 'responding' }, { merge: true }); } catch (e) { }
+          try { await rtdbUpdate(ref(rtdb, 'sos/' + sosId), { status: 'responding' }); } catch(e) {}
         }
         setStatus('responding');
 
@@ -298,14 +309,27 @@ export default function App() {
             eta: etaMin > 0 ? etaMin + ' min' : 'Arriving',
             progress,
           } : null);
+          // Update vehicle position in RTDB for admin tracking
+          if (sosId !== 'dummy_path') {
+            try { rtdbUpdate(ref(rtdb, 'dispatch/' + sosId), { vehiclePos: { lat: routeCoords[idx][0], lng: routeCoords[idx][1] }, eta: etaMin > 0 ? etaMin + ' min' : 'Arriving', progress }); } catch(e) {}
+          }
 
           if (progress >= 1) {
             clearInterval(vehicleIntervalRef.current);
             vehicleIntervalRef.current = null;
-            setTimeout(() => {
+            setTimeout(async () => {
               Alert.alert('Help Arrived', `${facility.name} responder has reached your location.`);
               if (sosId !== 'dummy_path') {
-                try { setDoc(doc(firestore, 'sos', sosId), { status: 'arrived' }, { merge: true }); } catch (e) { }
+                try { await setDoc(doc(firestore, 'sos', sosId), { status: 'arrived' }, { merge: true }); } catch (e) { }
+                try { await rtdbUpdate(ref(rtdb, 'sos/' + sosId), { status: 'arrived' }); } catch(e) {}
+                try { await remove(ref(rtdb, 'dispatch/' + sosId)); } catch(e) {}
+                // Reset the dispatched team back to 'ready'
+                try {
+                  const teamSnap = await getDocs(query(collection(firestore, 'teams'), where('dispatchedSosId', '==', sosId)));
+                  teamSnap.forEach(async (d) => {
+                    await updateDoc(doc(firestore, 'teams', d.id), { status: 'ready', dispatchedSosId: null });
+                  });
+                } catch(e) { console.warn('Team reset failed:', e.message); }
               }
               setActiveSOSId(null);
               setStatus(null);
@@ -501,6 +525,8 @@ export default function App() {
       const sosId = timestamp.toString();
       const sosRef = doc(firestore, 'sos', sosId);
       await setDoc(sosRef, payload);
+      // Dual-write to RTDB for admin dashboard sync
+      try { await set(ref(rtdb, 'sos/' + sosId), payload); } catch(e) { console.warn('RTDB SOS write failed:', e.message); }
 
       setActiveSOSId(sosId);
       setStatus("searching");
@@ -551,6 +577,8 @@ export default function App() {
       const sosId = timestamp.toString();
       const sosRef = doc(firestore, 'sos', sosId);
       await setDoc(sosRef, payload);
+      // Dual-write to RTDB for admin dashboard sync
+      try { await set(ref(rtdb, 'sos/' + sosId), payload); } catch(e) { console.warn('RTDB SOS write failed:', e.message); }
 
       setActiveSOSId(sosId);
       setStatus("searching");
@@ -656,6 +684,17 @@ export default function App() {
               try {
                 await setDoc(doc(firestore, 'sos', activeSOSId), { status: 'cancelled' }, { merge: true });
               } catch (e) { console.log(e); }
+              // Mirror cancel to RTDB
+              try { await rtdbUpdate(ref(rtdb, 'sos/' + activeSOSId), { status: 'cancelled' }); } catch(e) {}
+              // Clean up dispatch tracking from RTDB
+              try { await remove(ref(rtdb, 'dispatch/' + activeSOSId)); } catch(e) {}
+              // Reset the dispatched team back to 'ready'
+              try {
+                const teamSnap = await getDocs(query(collection(firestore, 'teams'), where('dispatchedSosId', '==', activeSOSId)));
+                teamSnap.forEach(async (d) => {
+                  await updateDoc(doc(firestore, 'teams', d.id), { status: 'ready', dispatchedSosId: null });
+                });
+              } catch(e) { console.warn('Team reset on cancel failed:', e.message); }
             }
             setActiveSOSId(null);
             setStatus(null);
@@ -848,7 +887,7 @@ export default function App() {
           {Platform.OS === 'web' && WebMapComponent ? (
             <WebMapComponent userLoc={location} />
           ) : NativeMapComponent ? (
-            <NativeMapComponent userLoc={location} dispatchData={dispatchData} />
+            <NativeMapComponent userLoc={location} dispatchData={dispatchData} userRole={userRole} />
           ) : (
             <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: 30 }}>
               <Text style={{ color: '#fff', fontSize: 28, fontWeight: '700', marginBottom: 12 }}>Citizen Map</Text>
@@ -934,10 +973,7 @@ export default function App() {
                   <Text style={{ color: currentScreen === 'Map' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Mesh Map</Text>
                 </TouchableOpacity>
 
-                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('AdminLiveSOS'); setIsMenuOpen(false); }}>
-                  <AlertTriangle color={currentScreen === 'AdminLiveSOS' ? '#dc2626' : '#888'} size={24} />
-                  <Text style={{ color: currentScreen === 'AdminLiveSOS' ? '#fff' : '#aaa', fontSize: 16, fontWeight: '700' }}>Live SOS Alerts</Text>
-                </TouchableOpacity>
+
 
                 <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', gap: 16, paddingVertical: 16 }} onPress={() => { setCurrentScreen('AdminTeams'); setIsMenuOpen(false); }}>
                   <Users color={currentScreen === 'AdminTeams' ? '#dc2626' : '#888'} size={24} />

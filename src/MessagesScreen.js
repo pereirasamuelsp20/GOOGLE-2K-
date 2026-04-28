@@ -57,13 +57,48 @@ export default function MessagesScreen() {
     return () => unsub();
   }, [currentUser]);
 
-  // BUG 2: Fetch device contacts and match against Firestore users
+  // Normalize phone number: strip all non-digits, remove country code, keep last 10 digits
+  const normalizePhone = (raw) => {
+    if (!raw) return '';
+    const digits = raw.replace(/\D/g, '');
+    // Indian numbers: strip +91 or 91 prefix, keep last 10 digits
+    if (digits.length > 10) {
+      return digits.slice(-10);
+    }
+    return digits;
+  };
+
+  // Fetch device contacts and match against Firestore users
   useEffect(() => {
     if (!currentUser || !Contacts) return;
     
+    const CACHE_KEY = `@reliefmesh_contacts_${currentUser.uid}`;
+    
+    // Load cached contacts immediately for instant display
+    const loadCached = async () => {
+      try {
+        const cached = await AsyncStorage.getItem(CACHE_KEY);
+        if (cached) {
+          const { matched, unmatched, timestamp } = JSON.parse(cached);
+          if (matched) setDeviceContacts(matched);
+          if (unmatched) setUnmatchedContacts(unmatched);
+          // If cache is fresh (< 5 min), skip background sync
+          if (timestamp && Date.now() - timestamp < 5 * 60 * 1000) return false;
+        }
+      } catch (e) { /* ignore cache errors */ }
+      return true; // should sync
+    };
+
     const fetchDeviceContacts = async () => {
       try {
-        setLoadingContacts(true);
+        const shouldSync = await loadCached();
+        setLoadingContacts(shouldSync);
+        
+        if (!shouldSync) {
+          setLoadingContacts(false);
+          return;
+        }
+        
         const { status } = await Contacts.requestPermissionsAsync();
         if (status !== 'granted') {
           console.warn('Contacts permission denied');
@@ -72,8 +107,10 @@ export default function MessagesScreen() {
         }
 
         const { data } = await Contacts.getContactsAsync({
-          fields: [Contacts.Fields.PhoneNumbers, Contacts.Fields.Name],
+          fields: [Contacts.Fields.PhoneNumbers, Contacts.Fields.Emails, Contacts.Fields.Name],
           sort: Contacts.SortTypes.FirstName,
+          pageSize: 200, // Limit to first 200 contacts
+          pageOffset: 0,
         });
 
         if (!data || data.length === 0) {
@@ -81,42 +118,66 @@ export default function MessagesScreen() {
           return;
         }
 
-        // Extract all phone numbers from device contacts
-        const phoneMap = {}; // phone -> contact
+        // Extract phone numbers AND emails from device contacts (limited set)
+        const phoneMap = {}; // normalizedPhone -> contact info
+        const emailMap = {}; // email -> contact info
+
         data.forEach(contact => {
+          const contactName = contact.name || contact.firstName || 'Unknown';
+
+          // Process phone numbers
           if (contact.phoneNumbers) {
             contact.phoneNumbers.forEach(pn => {
-              // Normalize phone number (remove spaces, dashes)
-              const normalized = pn.number?.replace(/[\s\-()]/g, '') || '';
+              const raw = pn.number || '';
+              const normalized = normalizePhone(raw);
               if (normalized.length >= 10) {
                 phoneMap[normalized] = {
-                  name: contact.name || contact.firstName || 'Unknown',
-                  phone: pn.number,
+                  name: contactName,
+                  phone: raw,
                   normalizedPhone: normalized,
+                };
+              }
+            });
+          }
+
+          // Process emails for broader matching
+          if (contact.emails) {
+            contact.emails.forEach(em => {
+              const email = (em.email || '').toLowerCase().trim();
+              if (email) {
+                emailMap[email] = {
+                  name: contactName,
+                  email: email,
                 };
               }
             });
           }
         });
 
-        const phoneNumbers = Object.keys(phoneMap);
-        if (phoneNumbers.length === 0) {
+        const normalizedPhones = Object.keys(phoneMap);
+        const emails = Object.keys(emailMap);
+
+        if (normalizedPhones.length === 0 && emails.length === 0) {
           setLoadingContacts(false);
           return;
         }
 
-        // Query Firestore users in batches of 10 (Firestore 'in' query limit)
+        // Query Firestore users in batches of 30 (increased from 10 for fewer round-trips)
         const matched = [];
         const matchedPhones = new Set();
-        for (let i = 0; i < phoneNumbers.length; i += 10) {
-          const batch = phoneNumbers.slice(i, i + 10);
+        const matchedUids = new Set();
+
+        // --- Match by normalized phone number only (no redundant alt-format queries) ---
+        for (let i = 0; i < normalizedPhones.length; i += 30) {
+          const batch = normalizedPhones.slice(i, i + 30);
           try {
             const q = query(collection(firestore, 'users'), where('phoneNumber', 'in', batch));
             const snap = await getDocs(q);
             snap.forEach(d => {
               const userData = d.data();
-              if (d.id !== currentUser.uid) {
-                const contactInfo = phoneMap[userData.phoneNumber] || {};
+              if (d.id !== currentUser.uid && !matchedUids.has(d.id)) {
+                const userNormalized = normalizePhone(userData.phoneNumber);
+                const contactInfo = phoneMap[userNormalized] || phoneMap[userData.phoneNumber] || {};
                 matched.push({
                   id: d.id,
                   uid: d.id,
@@ -124,25 +185,62 @@ export default function MessagesScreen() {
                   deviceCode: userData.deviceCode || '',
                   publicKey: userData.publicKey || '',
                   phoneNumber: userData.phoneNumber,
-                  localName: contactInfo.name, // Name from device
+                  localName: contactInfo.name,
                   source: 'device',
                 });
-                matchedPhones.add(userData.phoneNumber);
+                matchedPhones.add(userNormalized);
+                matchedUids.add(d.id);
               }
             });
           } catch (e) {
-            // Batch query failed, continue
+            console.warn('[ContactSync] Phone batch query failed:', e.message);
+          }
+        }
+
+        // --- Match by email (single pass, no alt formats) ---
+        for (let i = 0; i < emails.length; i += 30) {
+          const batch = emails.slice(i, i + 30);
+          try {
+            const q = query(collection(firestore, 'users'), where('email', 'in', batch));
+            const snap = await getDocs(q);
+            snap.forEach(d => {
+              const userData = d.data();
+              if (d.id !== currentUser.uid && !matchedUids.has(d.id)) {
+                const contactInfo = emailMap[(userData.email || '').toLowerCase()] || {};
+                matched.push({
+                  id: d.id,
+                  uid: d.id,
+                  name: userData.displayName || contactInfo.name || 'User',
+                  deviceCode: userData.deviceCode || '',
+                  publicKey: userData.publicKey || '',
+                  phoneNumber: userData.phoneNumber || '',
+                  email: userData.email,
+                  localName: contactInfo.name,
+                  source: 'device',
+                });
+                matchedUids.add(d.id);
+              }
+            });
+          } catch (e) {
+            console.warn('[ContactSync] Email batch query failed:', e.message);
           }
         }
 
         setDeviceContacts(matched);
 
-        // Build unmatched list (device contacts not on ReliefMesh)
+        // Build unmatched list (limit to first 50 for performance)
         const unmatched = Object.values(phoneMap)
           .filter(c => !matchedPhones.has(c.normalizedPhone))
-          .slice(0, 30); // Limit to 30 for performance
+          .slice(0, 50);
         setUnmatchedContacts(unmatched);
         setLoadingContacts(false);
+        
+        // Cache results for instant load next time
+        try {
+          await AsyncStorage.setItem(CACHE_KEY, JSON.stringify({
+            matched, unmatched, timestamp: Date.now(),
+          }));
+        } catch (e) { /* ignore cache write errors */ }
       } catch (e) {
         console.warn('Device contacts fetch failed:', e.message);
         setLoadingContacts(false);

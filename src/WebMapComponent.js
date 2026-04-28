@@ -20,7 +20,7 @@ export default function WebMapComponent({ userLoc }) {
   const [sosList, setSosList] = useState([]);
 
   useEffect(() => {
-    // Zones Listener (from web-dashboard logic)
+    // Zones Listener
     const unsub = onSnapshot(collection(firestore, 'zones'), snap => {
       const z = [];
       const now = Date.now();

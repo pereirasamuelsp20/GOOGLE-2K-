@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { View, StyleSheet, ActivityIndicator, Text, Platform } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { collection, onSnapshot, query, where } from 'firebase/firestore';
@@ -22,7 +22,7 @@ const MUMBAI_LNG = 72.8777;
 const LAN_IP = '10.61.78.188';
 const API_BASE = `http://${LAN_IP}:4000/api`;
 
-export default function NativeMapComponent({ userLoc, dispatchData }) {
+export default function NativeMapComponent({ userLoc, dispatchData, userRole }) {
   const webViewRef = useRef(null);
   const [sosList, setSosList] = useState([]);
   const [zones, setZones] = useState([]);
@@ -30,17 +30,61 @@ export default function NativeMapComponent({ userLoc, dispatchData }) {
   const [importantLocations, setImportantLocations] = useState([]);
   const [webViewReady, setWebViewReady] = useState(false);
 
-  // Firebase SOS listener
+  // Firebase SOS listener — with BloomFilter error recovery
   useEffect(() => {
-    try {
-      const q = query(collection(firestore, 'sos'), where('status', 'in', ['searching', 'routed', 'responding']));
-      const unsub = onSnapshot(q, (snap) => {
-        const data = [];
-        snap.forEach((d) => { const v = d.data(); if (v.lat && v.lng) data.push({ id: d.id, ...v }); });
-        setSosList(data);
-      });
-      return () => unsub();
-    } catch (e) { console.warn('SOS listener error:', e.message); }
+    let unsub = null;
+    let retryTimeout = null;
+
+    const startListener = (useIndividualQueries = false) => {
+      try {
+        if (useIndividualQueries) {
+          // Fallback: listen to each status separately to avoid 'in' operator BloomFilter issues
+          console.log('[MeshMap] Using individual status queries (BloomFilter fallback)');
+          const statuses = ['searching', 'routed', 'responding'];
+          const unsubList = [];
+          const buckets = {};
+          statuses.forEach(status => {
+            const q = query(collection(firestore, 'sos'), where('status', '==', status));
+            const u = onSnapshot(q, (snap) => {
+              const items = [];
+              snap.forEach((d) => { const v = d.data(); if (v.lat && v.lng) items.push({ id: d.id, ...v }); });
+              buckets[status] = items;
+              // Merge all buckets
+              const merged = [];
+              Object.values(buckets).forEach(arr => merged.push(...arr));
+              setSosList(merged);
+            }, (err) => {
+              console.warn('[MeshMap] Individual SOS listener error (' + status + '):', err.message);
+            });
+            unsubList.push(u);
+          });
+          unsub = () => unsubList.forEach(u => u());
+        } else {
+          const q = query(collection(firestore, 'sos'), where('status', 'in', ['searching', 'routed', 'responding']));
+          unsub = onSnapshot(q, (snap) => {
+            const data = [];
+            snap.forEach((d) => { const v = d.data(); if (v.lat && v.lng) data.push({ id: d.id, ...v }); });
+            setSosList(data);
+          }, (err) => {
+            console.warn('[MeshMap] SOS listener error (BloomFilter?), retrying with fallback:', err.message);
+            if (unsub) { unsub(); unsub = null; }
+            // Retry with individual queries after 1s
+            retryTimeout = setTimeout(() => startListener(true), 1000);
+          });
+        }
+      } catch (e) {
+        console.warn('[MeshMap] SOS listener setup error:', e.message);
+        // Last resort: retry with individual queries
+        retryTimeout = setTimeout(() => startListener(true), 2000);
+      }
+    };
+
+    startListener(false);
+
+    return () => {
+      if (unsub) unsub();
+      if (retryTimeout) clearTimeout(retryTimeout);
+    };
   }, []);
 
   // Firebase zones listener
@@ -55,23 +99,23 @@ export default function NativeMapComponent({ userLoc, dispatchData }) {
     } catch (e) { console.warn('Zones listener error:', e.message); }
   }, []);
 
-  // Fetch reports from backend API + poll every 30s
-  useEffect(() => {
-    const fetchReports = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/reports`, {
-          headers: { 'Accept': 'application/json' },
-        });
-        if (!res.ok) return;
-        const data = await res.json();
-        if (Array.isArray(data)) setReports(data);
-      } catch (err) {
-        console.warn('[MeshMap] Reports fetch error:', err.message);
-      }
-    };
+  // Fetch reports from backend API + poll every 15s
+  const fetchReports = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/reports`, {
+        headers: { 'Accept': 'application/json' },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data)) setReports(data);
+    } catch (err) {
+      console.warn('[MeshMap] Reports fetch error:', err.message);
+    }
+  };
 
+  useEffect(() => {
     fetchReports(); // initial fetch
-    const interval = setInterval(fetchReports, 30000); // poll every 30s
+    const interval = setInterval(fetchReports, 15000); // poll every 15s
     return () => clearInterval(interval);
   }, []);
 
@@ -119,25 +163,37 @@ export default function NativeMapComponent({ userLoc, dispatchData }) {
       userLoc: userLoc ? { lat: userLoc.latitude, lng: userLoc.longitude } : null,
       orsKey: ORS_API_KEY,
       dispatch: dispatchData || null,
+      userRole: userRole || 'Citizen',
     });
-  }, [sosList, zones, userLoc, reports, importantLocations, dispatchData]);
+  }, [sosList, zones, userLoc, reports, importantLocations, dispatchData, userRole]);
 
-  // BUG 3: Debounce data pushes to WebView (300ms) to prevent flooding on rapid state changes
+  // Debounce data pushes to WebView (300ms) to prevent flooding on rapid state changes
   const debounceTimerRef = useRef(null);
-  const lastLocRef = useRef(null); // BUG 3: track last sent location for throttling
+  const lastLocRef = useRef(null); // track last sent location for throttling
+
+  // Track whether non-location data changed so we can always push it
+  const lastNonLocPayloadRef = useRef(null);
 
   useEffect(() => {
     if (!webViewReady || !webViewRef.current) return;
 
-    // BUG 3: Throttle location updates — only push if moved > 10 meters
-    if (userLoc) {
+    // Check if non-location data actually changed (SOS, dispatch, reports, etc.)
+    const nonLocFingerprint = JSON.stringify({ sosList, zones, reports, importantLocations, dispatchData, userRole });
+    const nonLocChanged = nonLocFingerprint !== lastNonLocPayloadRef.current;
+
+    // Throttle LOCATION-ONLY updates — only push if moved > 10 meters
+    // But always allow pushes when other data (SOS, dispatch, reports) changed
+    if (!nonLocChanged && userLoc) {
       const prev = lastLocRef.current;
       if (prev) {
         const dist = haversineMeters(prev.latitude, prev.longitude, userLoc.latitude, userLoc.longitude);
-        if (dist < 10) return; // Skip if location hasn't meaningfully changed
+        if (dist < 10) return; // Skip if ONLY location changed and it's < 10m
       }
-      lastLocRef.current = userLoc;
     }
+
+    // Update tracking refs
+    if (userLoc) lastLocRef.current = userLoc;
+    if (nonLocChanged) lastNonLocPayloadRef.current = nonLocFingerprint;
 
     // Debounce: batch rapid state changes into a single postMessage
     if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
@@ -161,6 +217,23 @@ export default function NativeMapComponent({ userLoc, dispatchData }) {
         console.log('[MeshMap] WebView signalled READY');
         setWebViewReady(true);
       }
+      // Admin: resolve a report from the map popup
+      if (msg.type === 'RESOLVE_REPORT' && msg.reportId) {
+        console.log('[MeshMap] Admin resolving report:', msg.reportId);
+        fetch(`${API_BASE}/reports/${msg.reportId}/status`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'Resolved' }),
+        }).then(res => {
+          if (res.ok) {
+            console.log('[MeshMap] Report resolved successfully');
+            // Re-fetch reports to update the map in real time
+            fetchReports();
+          } else {
+            console.warn('[MeshMap] Failed to resolve report:', res.status);
+          }
+        }).catch(e => console.warn('[MeshMap] Resolve error:', e.message));
+      }
       if (msg.type === 'REROUTE_NEEDED' && dispatchData && !rerouteInProgress.current) {
         rerouteInProgress.current = true;
         console.log('[MeshMap] Rerouting around blockage at', msg.blockageLat, msg.blockageLng);
@@ -178,8 +251,6 @@ export default function NativeMapComponent({ userLoc, dispatchData }) {
             const newRoute = data.features[0].geometry.coordinates.map(c => [c[1], c[0]]);
             const summary = data.features[0].properties.summary;
             console.log('[MeshMap] Rerouted successfully, new ETA:', Math.ceil(summary.duration / 60), 'min');
-            // We can't call setDispatchData from here since it's in App.js
-            // Instead, update the WebView directly with the new route
             if (webViewRef.current) {
               webViewRef.current.postMessage(JSON.stringify({
                 type: 'UPDATE_DATA',
@@ -197,19 +268,52 @@ export default function NativeMapComponent({ userLoc, dispatchData }) {
     } catch (_) { }
   }, [dispatchData, userLoc]);
 
-  const mapHTML = `<!DOCTYPE html>
+  const mapHTML = useMemo(() => `<!DOCTYPE html>
 <html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
-<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;overflow:hidden;background:#1a1a2e;font-family:-apple-system,system-ui,sans-serif}
-#map{width:100%;height:100%}
+#map{position:absolute;top:0;left:0;right:0;bottom:0;z-index:1}
+#loadStatus{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9999;color:#888;font-size:13px;text-align:center;pointer-events:none}
+#loadStatus.error{color:#dc2626}
+#loadStatus.hidden{display:none}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css"/>
+<script>
+// Async CDN loader with fallback
+var _cdnList=[
+  ['https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js','https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'],
+  ['https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.min.js','https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js']
+];
+var _loadIdx=0;
+function _loadNext(){
+  if(_loadIdx>=_cdnList.length){initMapIfReady();return;}
+  var urls=_cdnList[_loadIdx];
+  var s=document.createElement('script');
+  s.src=urls[0];
+  s.onload=function(){_loadIdx++;_loadNext();};
+  s.onerror=function(){
+    var s2=document.createElement('script');
+    s2.src=urls[1];
+    s2.onload=function(){_loadIdx++;_loadNext();};
+    s2.onerror=function(){
+      var ls=document.getElementById('loadStatus');
+      if(ls){ls.className='error';ls.textContent='Failed to load map library. Check internet.';}
+    };
+    document.head.appendChild(s2);
+  };
+  document.head.appendChild(s);
+}
+// Start loading immediately
+var ls0=document.getElementById('loadStatus');
+if(ls0)ls0.textContent='Downloading map library...';
+_loadNext();
+</script>
+<style>
 .leaflet-control-attribution{display:none!important}
+.leaflet-tile-pane{will-change:transform}
 
 /* ── Zoom controls: bottom-right, custom dark theme ── */
 .leaflet-control-zoom{border:none!important;position:absolute!important;bottom:24px!important;right:16px!important;z-index:1001!important;margin:0!important}
@@ -316,6 +420,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:#1a1a2e;font-family:
   <div class="filter-chip active" data-type="police" style="--c:#3B82F6" onclick="toggleFilter(this)">🚔 Police</div>
   <div class="filter-chip active" data-type="shelter" style="--c:#F59E0B" onclick="toggleFilter(this)">🏠 Shelters</div>
 </div>
+<div id="loadStatus">Loading map engine...</div>
 <div id="map"></div>
 <div class="eta-bar" id="etaBar">
   <div class="eta-item"><div class="val" id="etaDrive">--</div><div class="lbl">🚗 Drive</div></div>
@@ -333,14 +438,36 @@ html,body{width:100%;height:100%;overflow:hidden;background:#1a1a2e;font-family:
   <div style="text-align:right"><div class="label">Zoom</div><div class="value" id="zoomLabel">13</div></div>
 </div>
 <script>
+var _mapReady=false;
+function initMapIfReady(){
+var ls=document.getElementById('loadStatus');
+if(typeof L==='undefined'){
+  if(ls)ls.textContent='Waiting for map library...';
+  setTimeout(initMapIfReady,500);
+  return;
+}
+if(ls)ls.textContent='Initializing map...';
+try{
 var MUMBAI=[${MUMBAI_LAT},${MUMBAI_LNG}];
-var map=L.map('map',{center:MUMBAI,zoom:13,zoomControl:false,attributionControl:false});
+var mapDiv=document.getElementById('map');
+if(!mapDiv){if(ls){ls.className='error';ls.textContent='Map container not found';}return;}
+var map=L.map(mapDiv,{center:MUMBAI,zoom:13,zoomControl:false,attributionControl:false,preferCanvas:true});
 
 // Add zoom control at bottom-right
 L.control.zoom({position:'bottomright'}).addTo(map);
 
-var osmTile=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19});
-osmTile.addTo(map);
+// Use standard OpenStreetMap tiles for colorful map
+var tileLayer=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,crossOrigin:true});
+tileLayer.on('tileerror',function(){
+  if(!tileLayer._triedFallback){
+    tileLayer._triedFallback=true;
+    tileLayer.setUrl('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png');
+  }
+});
+tileLayer.addTo(map);
+
+// Force map to recalculate size after a tick (Android WebView timing fix)
+setTimeout(function(){map.invalidateSize();if(ls)ls.className='hidden';_mapReady=true;},300);
 
 // Mumbai landmarks — preserved from original
 var landmarks=[
@@ -441,6 +568,7 @@ function formatDate(dateStr){
 }
 
 // ── Build popup HTML for a report ──
+var currentUserRole='Citizen';
 function buildReportPopup(r){
   var color=getReportColor(r.calamityType);
   var icon=getReportIconChar(r.calamityType);
@@ -455,7 +583,15 @@ function buildReportPopup(r){
   html+='<div class="popup-time">🕐 '+formatDate(r.createdAt)+'</div>';
   html+='<span class="popup-badge '+badgeClass+'">'+(r.status||'Reported')+'</span>';
   html+='</div>';
+  // Admin: add Mark Resolved button
+  if(currentUserRole==='Admin'&&r.status!=='Resolved'){
+    var rid=r._id||r.id;
+    html+='<button onclick="resolveReport(\''+rid+'\')" style="width:100%;margin-top:10px;padding:8px 0;border-radius:8px;border:none;background:#22c55e;color:#fff;font-weight:700;font-size:12px;cursor:pointer;letter-spacing:0.5px">✓ Mark Resolved</button>';
+  }
   return html;
+}
+function resolveReport(id){
+  try{window.ReactNativeWebView.postMessage(JSON.stringify({type:'RESOLVE_REPORT',reportId:id}));}catch(e){}
 }
 
 // ── Update report markers (delta only) ──
@@ -503,6 +639,8 @@ function getZoneColor(t){
 }
 
 function updateMap(data){
+  // Track user role for admin features
+  if(data.userRole) currentUserRole=data.userRole;
   if(data.userLoc){
     if(userMarker){userMarker.setLatLng([data.userLoc.lat,data.userLoc.lng])}
     else{userMarker=L.marker([data.userLoc.lat,data.userLoc.lng],{icon:createUserIcon()}).addTo(map);map.setView([data.userLoc.lat,data.userLoc.lng],14)}
@@ -518,8 +656,13 @@ function updateMap(data){
       zoneCircles.push(circle);
     });
   }
-  // Update report markers (delta-only)
+  // Update report markers — force full refresh when admin resolves
   if(data.reports){
+    // Clear and rebuild all report markers for fresh popup content
+    Object.keys(knownReportIds).forEach(function(id){
+      reportCluster.removeLayer(knownReportIds[id]);
+    });
+    knownReportIds={};
     updateReports(data.reports);
     updateBlockageZones(data.reports);
   }
@@ -754,14 +897,35 @@ try{
     window.ReactNativeWebView.postMessage(JSON.stringify({type:'WEBVIEW_READY'}));
   }
 } catch(e){}
+}catch(err){
+  var ls=document.getElementById('loadStatus');
+  if(ls){ls.className='error';ls.textContent='Map error: '+err.message;}
+}
+} // end initMapIfReady
+
+// Start map initialization - wait for Leaflet to be available
+// (initMapIfReady is called by _loadNext after all scripts are loaded)
+// Hard timeout: if map not ready in 10s, show diagnostic
+setTimeout(function(){
+  if(!_mapReady){
+    var ls=document.getElementById('loadStatus');
+    if(ls && ls.className!=='hidden'){
+      ls.className='error';
+      ls.textContent='Map timed out. Leaflet: '+(typeof L!=='undefined')+'. Retry: refresh app.';
+    }
+  }
+},10000);
 </script>
-</body></html>`;
+</body></html>`, []);  // Memoize — HTML only uses module-level constants, never needs to change
 
   return (
     <View style={styles.container}>
       <WebView
         ref={webViewRef}
-        source={{ html: mapHTML }}
+        source={Platform.OS === 'android'
+          ? { uri: 'file:///android_asset/meshMap.html' }
+          : { html: mapHTML }
+        }
         style={styles.webview}
         originWhitelist={['*']}
         javaScriptEnabled={true}
@@ -773,6 +937,18 @@ try{
             <Text style={styles.loadingText}>Loading Map...</Text>
           </View>
         )}
+        renderError={(errorDomain, errorCode, errorDesc) => (
+          <View style={styles.loadingContainer}>
+            <Text style={{ color: '#dc2626', fontSize: 16, fontWeight: '700', marginBottom: 8 }}>Map Load Error</Text>
+            <Text style={{ color: '#888', fontSize: 12, textAlign: 'center' }}>{errorDesc || 'Check your internet connection'}</Text>
+          </View>
+        )}
+        onError={(syntheticEvent) => {
+          console.warn('[MeshMap] WebView error:', syntheticEvent.nativeEvent.description);
+        }}
+        onHttpError={(syntheticEvent) => {
+          console.warn('[MeshMap] WebView HTTP error:', syntheticEvent.nativeEvent.statusCode);
+        }}
         onMessage={handleWebViewMessage}
         scrollEnabled={false}
         bounces={false}
@@ -784,9 +960,13 @@ try{
         allowsBackForwardNavigationGestures={false}
         mediaPlaybackRequiresUserAction={false}
         allowsLinkPreview={false}
-        /* BUG 3: Enable hardware acceleration on Android */
-        androidLayerType="hardware"
+        /* 'software' is most reliable for map rendering on Android physical devices */
+        androidLayerType="software"
         androidHardwareAccelerationDisabled={false}
+        cacheEnabled={true}
+        cacheMode="LOAD_DEFAULT"
+        setSupportMultipleWindows={false}
+        thirdPartyCookiesEnabled={true}
       />
     </View>
   );

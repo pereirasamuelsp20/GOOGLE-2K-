@@ -259,14 +259,17 @@ export default function ReportIssueScreen({ userLocation, userRole }) {
 
       // Read the response body once as text, then parse
       const responseText = await res.text();
-      console.log('[Submit] Response status:', res.status, 'body:', responseText.substring(0, 300));
+      console.log('[Submit] Response status:', res.status, 'body:', responseText.substring(0, 500));
 
       if (!res.ok) {
         let errorMsg = `Server returned ${res.status}`;
         try {
           const errBody = JSON.parse(responseText);
-          errorMsg = errBody.error || errorMsg;
-        } catch (_) {}
+          errorMsg = errBody.error || errBody.message || errorMsg;
+        } catch (_) {
+          // Response wasn't JSON — show raw text
+          if (responseText) errorMsg += ': ' + responseText.substring(0, 200);
+        }
         throw new Error(errorMsg);
       }
 
@@ -289,7 +292,7 @@ export default function ReportIssueScreen({ userLocation, userRole }) {
       if (err.name === 'AbortError') {
         Alert.alert('Connection Timeout', 'Could not reach the server. Make sure the backend is running and your device is on the same WiFi network as the server.');
       } else {
-        Alert.alert('Submission Failed', `${err.message}\n\nMake sure the backend server is running at ${API_BASE.replace('/api', '')}`);
+        Alert.alert('Submission Failed', err.message);
       }
       console.warn('[Submit] Error:', err.message);
     } finally {
