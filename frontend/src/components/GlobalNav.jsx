@@ -193,7 +193,7 @@ export default function GlobalNav() {
               onClick={async () => {
                 setIsOpen(false);
                 await signOut(auth);
-                window.location.href = '/admin';
+                window.location.href = '/';
               }}
               style={{ ...navLinkStyle, color: '#dc2626', background: 'transparent', border: 'none', cursor: 'pointer', width: '100%' }}
             >

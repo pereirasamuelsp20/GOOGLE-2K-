@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: GOOGLE-2K-1
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+
+  - type: web
+    name: GOOGLE-2K
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install; npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
