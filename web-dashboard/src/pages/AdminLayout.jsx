@@ -37,7 +37,7 @@ function LiveSos() {
       const arr = [];
       if (data) {
         Object.keys(data).forEach(k => {
-          if (data[k].status === 'searching' || data[k].status === 'routed') {
+          if (data[k].status === 'searching' || data[k].status === 'routed' || data[k].status === 'responding') {
             arr.push({ id: k, ...data[k] });
           }
         });

@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TextInput, TouchableOpacity,
-  ScrollView, Alert, ActivityIndicator, Platform
+  ScrollView, Alert, ActivityIndicator, Platform, Modal, ToastAndroid
 } from 'react-native';
 import { WebView } from 'react-native-webview';
-import { AlertTriangle, ChevronDown, MapPin, Clock, Send } from 'lucide-react-native';
+import { AlertTriangle, ChevronDown, MapPin, Clock, Send, Navigation, X } from 'lucide-react-native';
+import * as Location from 'expo-location';
 
 // Use the Mac's LAN IP so physical devices can reach the backend.
 // For Android emulator use 10.0.2.2, for iOS simulator use localhost.
@@ -50,8 +51,9 @@ const getIssueIcon = (type) => {
   return found ? found.icon : '⚠';
 };
 
-export default function ReportIssueScreen() {
+export default function ReportIssueScreen({ userLocation, userRole }) {
   const webViewRef = useRef(null);
+  const pickerWebViewRef = useRef(null);
   const debounceRef = useRef(null);
 
   const [address, setAddress] = useState('');
@@ -67,6 +69,9 @@ export default function ReportIssueScreen() {
   const [reports, setReports] = useState([]);
   const [loadingReports, setLoadingReports] = useState(true);
   const [activeTab, setActiveTab] = useState('form'); // 'form' | 'reports'
+  const [showMapPicker, setShowMapPicker] = useState(false); // BUG 1: Road Blocked map picker
+  const [togglingId, setTogglingId] = useState(null); // BUG 6: loading state per-report
+  const [fetchingGPS, setFetchingGPS] = useState(false); // BUG 1: GPS fetch indicator
 
   // Fetch reports on mount
   useEffect(() => {
@@ -292,19 +297,207 @@ export default function ReportIssueScreen() {
     }
   };
 
+  // BUG 5: Only admins can toggle status. BUG 6: Loading + error states.
   const toggleStatus = async (id, currentStatus) => {
+    // BUG 5: Block non-admins from changing status
+    if (userRole !== 'Admin') {
+      Alert.alert('Restricted', 'Only admins can change report status.');
+      return;
+    }
+
     const newStatus = currentStatus === 'Reported' ? 'Resolved' : 'Reported';
+    setTogglingId(id); // BUG 6: show loading spinner on this report's badge
     try {
-      await fetch(`${API_BASE}/reports/${id}/status`, {
+      const res = await fetch(`${API_BASE}/reports/${id}/status`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-role': userRole || 'Citizen', // BUG 5: send role to server
+        },
         body: JSON.stringify({ status: newStatus }),
       });
-      setReports(prev => prev.map(r => r._id === id ? { ...r, status: newStatus } : r));
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.error || `Server returned ${res.status}`);
+      }
+      // BUG 6: re-fetch full list to ensure cache consistency
+      await fetchReports();
     } catch (err) {
       console.warn('Status update failed:', err.message);
+      Alert.alert('Update Failed', err.message);
+    } finally {
+      setTogglingId(null);
     }
   };
+
+  // BUG 1: Auto-fetch GPS location for non-road-blocked issues
+  const autoFetchLocation = useCallback(async () => {
+    setFetchingGPS(true);
+    try {
+      // Try userLocation prop first
+      let coords = userLocation;
+      if (!coords) {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status === 'granted') {
+          const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced, timeout: 5000 });
+          coords = loc.coords;
+        }
+      }
+      if (coords) {
+        const rLat = coords.latitude;
+        const rLng = coords.longitude;
+        setLat(rLat);
+        setLng(rLng);
+        setPinPlaced(true);
+        reverseGeocode(rLat, rLng);
+        webViewRef.current?.postMessage(JSON.stringify({ type: 'SET_PIN', lat: rLat, lng: rLng }));
+      }
+    } catch (err) {
+      console.warn('[AutoGPS] Failed:', err.message);
+    } finally {
+      setFetchingGPS(false);
+    }
+  }, [userLocation]);
+
+  // BUG 1: When issue type changes, auto-fetch location for non-road-blocked
+  useEffect(() => {
+    if (calamityType && calamityType !== 'Road Blocked') {
+      autoFetchLocation();
+    }
+  }, [calamityType, autoFetchLocation]);
+
+  // BUG 1: Handle Road Blocked location pin button
+  const handleLocationPinPress = () => {
+    if (calamityType === 'Road Blocked') {
+      setShowMapPicker(true);
+    } else {
+      autoFetchLocation();
+    }
+  };
+
+  // BUG 1: Handle map picker message (road-snap within 100m radius)
+  const onPickerMessage = (event) => {
+    try {
+      const data = JSON.parse(event.nativeEvent.data);
+      if (data.type === 'ROAD_PIN_PLACED') {
+        setLat(data.lat);
+        setLng(data.lng);
+        setPinPlaced(true);
+        reverseGeocode(data.lat, data.lng);
+        webViewRef.current?.postMessage(JSON.stringify({ type: 'SET_PIN', lat: data.lat, lng: data.lng }));
+        setShowMapPicker(false);
+      }
+    } catch (e) {}
+  };
+
+  // BUG 1: Road-snap map picker HTML (100m radius, Overpass road snap)
+  const userLat = userLocation?.latitude || lat;
+  const userLng = userLocation?.longitude || lng;
+  const pickerMapHTML = `<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#0D0D0D}
+#map{width:100%;height:100%}
+.leaflet-control-attribution{display:none!important}
+.leaflet-control-zoom{display:none!important}
+.info-banner{position:absolute;top:12px;left:12px;right:12px;z-index:1000;
+  background:rgba(204,0,0,0.9);color:#fff;padding:10px 14px;border-radius:10px;
+  font-size:13px;font-weight:700;text-align:center;backdrop-filter:blur(8px)}
+.confirm-btn{position:absolute;bottom:20px;left:20px;right:20px;z-index:1000;
+  background:#CC0000;color:#fff;border:none;padding:14px;border-radius:12px;
+  font-size:16px;font-weight:800;cursor:pointer;text-align:center;display:none}
+.confirm-btn.show{display:block}
+</style>
+</head><body>
+<div class="info-banner">🚧 Tap on a road within the circle to place blockage pin</div>
+<div id="map"></div>
+<button class="confirm-btn" id="confirmBtn" onclick="confirmPin()">CONFIRM LOCATION</button>
+<script>
+var CENTER=[${userLat},${userLng}];
+var RADIUS=100; // meters
+var map=L.map('map',{center:CENTER,zoom:17,zoomControl:false,attributionControl:false});
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
+
+// Draw 100m radius circle
+var circle=L.circle(CENTER,{radius:RADIUS,color:'#CC0000',fillColor:'#CC0000',fillOpacity:0.15,weight:2,dashArray:'6,4'}).addTo(map);
+
+// User location dot
+L.circleMarker(CENTER,{radius:6,color:'#3b82f6',fillColor:'#3b82f6',fillOpacity:1,weight:2,stroke:true,color:'#fff'}).addTo(map);
+
+var pinIcon=L.divIcon({
+  className:'',
+  html:'<svg width="30" height="42" viewBox="0 0 30 42"><path d="M15 0C6.716 0 0 6.716 0 15c0 10.5 15 27 15 27s15-16.5 15-27C30 6.716 23.284 0 15 0z" fill="#CC0000"/><circle cx="15" cy="14" r="6" fill="#0D0D0D"/><circle cx="15" cy="14" r="3" fill="#CC0000"/></svg>',
+  iconSize:[30,42],iconAnchor:[15,42]
+});
+
+var marker=null;
+var snappedLat=null,snappedLng=null;
+
+// Haversine distance in meters
+function haversine(lat1,lng1,lat2,lng2){
+  var R=6371000;
+  var dLat=(lat2-lat1)*Math.PI/180;
+  var dLng=(lng2-lng1)*Math.PI/180;
+  var a=Math.sin(dLat/2)*Math.sin(dLat/2)+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)*Math.sin(dLng/2);
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+
+// Snap to nearest road using Overpass API
+async function snapToRoad(lat,lng){
+  try{
+    var query='[out:json];way(around:50,'+lat+','+lng+')["highway"];out geom;';
+    var res=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',body:query});
+    var data=await res.json();
+    if(!data.elements||data.elements.length===0) return null;
+    // Find nearest point on any road geometry
+    var bestDist=Infinity,bestPt=null;
+    data.elements.forEach(function(el){
+      if(!el.geometry)return;
+      el.geometry.forEach(function(pt){
+        var d=haversine(lat,lng,pt.lat,pt.lon);
+        if(d<bestDist){bestDist=d;bestPt={lat:pt.lat,lng:pt.lon};}
+      });
+    });
+    return bestPt;
+  }catch(e){
+    console.warn('Overpass error:',e.message);
+    return null;
+  }
+}
+
+map.on('click',async function(e){
+  var dist=haversine(CENTER[0],CENTER[1],e.latlng.lat,e.latlng.lng);
+  if(dist>RADIUS){
+    // Outside radius — flash the circle
+    circle.setStyle({fillOpacity:0.4});
+    setTimeout(function(){circle.setStyle({fillOpacity:0.15})},300);
+    return;
+  }
+  // Snap to nearest road
+  var snapped=await snapToRoad(e.latlng.lat,e.latlng.lng);
+  var pinLat=snapped?snapped.lat:e.latlng.lat;
+  var pinLng=snapped?snapped.lng:e.latlng.lng;
+  // Verify snapped point is still within radius
+  if(haversine(CENTER[0],CENTER[1],pinLat,pinLng)>RADIUS){
+    pinLat=e.latlng.lat;pinLng=e.latlng.lng;
+  }
+  snappedLat=pinLat;snappedLng=pinLng;
+  if(marker) map.removeLayer(marker);
+  marker=L.marker([pinLat,pinLng],{icon:pinIcon}).addTo(map);
+  document.getElementById('confirmBtn').classList.add('show');
+});
+
+function confirmPin(){
+  if(snappedLat!=null){
+    window.ReactNativeWebView.postMessage(JSON.stringify({type:'ROAD_PIN_PLACED',lat:snappedLat,lng:snappedLng}));
+  }
+}
+</script>
+</body></html>`;
 
   const formatDate = (dateStr) => {
     const d = new Date(dateStr);
@@ -413,16 +606,29 @@ window.addEventListener('message',function(e){
             <Text style={styles.resolvedLocation}>{resolvedLocation}</Text>
           ) : null}
 
-          {/* Address Input */}
+          {/* Address Input + Location Pin Button */}
           <View style={styles.addressWrap}>
             <MapPin color="#666" size={16} style={{ marginRight: 8 }} />
             <TextInput
               style={styles.addressInput}
-              placeholder="Enter address or tap on map…"
+              placeholder={fetchingGPS ? 'Fetching your location…' : 'Enter address or tap on map…'}
               placeholderTextColor="#555"
               value={address}
               onChangeText={handleAddressChange}
+              editable={!fetchingGPS}
             />
+            {/* BUG 1: Location pin button */}
+            <TouchableOpacity
+              onPress={handleLocationPinPress}
+              disabled={fetchingGPS || !calamityType}
+              style={{ padding: 8, opacity: (!calamityType || fetchingGPS) ? 0.3 : 1 }}
+            >
+              {fetchingGPS ? (
+                <ActivityIndicator size="small" color="#CC0000" />
+              ) : (
+                <Navigation color="#CC0000" size={18} />
+              )}
+            </TouchableOpacity>
           </View>
 
           {/* Issue Type */}
@@ -534,18 +740,36 @@ window.addEventListener('message',function(e){
                     <Text style={{ fontSize: 20 }}>{getIssueIcon(r.calamityType)}</Text>
                     <Text style={styles.reportTypeLabel}>{r.calamityType}</Text>
                   </View>
-                  <TouchableOpacity
-                    style={[
+                  {/* BUG 5: Only show toggle for admins. BUG 6: Loading spinner */}
+                  {userRole === 'Admin' ? (
+                    <TouchableOpacity
+                      style={[
+                        styles.statusBadge,
+                        r.status === 'Resolved' ? styles.statusResolved : styles.statusReported
+                      ]}
+                      onPress={() => toggleStatus(r._id, r.status)}
+                      disabled={togglingId === r._id}
+                    >
+                      {togglingId === r._id ? (
+                        <ActivityIndicator size="small" color={r.status === 'Resolved' ? '#22C55E' : '#F59E0B'} />
+                      ) : (
+                        <Text style={[
+                          styles.statusBadgeText,
+                          { color: r.status === 'Resolved' ? '#22C55E' : '#F59E0B' }
+                        ]}>{r.status}</Text>
+                      )}
+                    </TouchableOpacity>
+                  ) : (
+                    <View style={[
                       styles.statusBadge,
                       r.status === 'Resolved' ? styles.statusResolved : styles.statusReported
-                    ]}
-                    onPress={() => toggleStatus(r._id, r.status)}
-                  >
-                    <Text style={[
-                      styles.statusBadgeText,
-                      { color: r.status === 'Resolved' ? '#22C55E' : '#F59E0B' }
-                    ]}>{r.status}</Text>
-                  </TouchableOpacity>
+                    ]}>
+                      <Text style={[
+                        styles.statusBadgeText,
+                        { color: r.status === 'Resolved' ? '#22C55E' : '#F59E0B' }
+                      ]}>{r.status}</Text>
+                    </View>
+                  )}
                 </View>
 
                 <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 6, marginBottom: 4 }}>
@@ -569,6 +793,28 @@ window.addEventListener('message',function(e){
           <View style={{ height: 40 }} />
         </ScrollView>
       )}
+
+      {/* BUG 1: Road Blocked Map Picker Modal */}
+      <Modal visible={showMapPicker} animationType="slide" transparent={false}>
+        <View style={{ flex: 1, backgroundColor: '#0D0D0D' }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingTop: Platform.OS === 'ios' ? 50 : 30, paddingBottom: 10 }}>
+            <Text style={{ color: '#CC0000', fontSize: 18, fontWeight: '900', letterSpacing: 1 }}>ROAD BLOCKAGE PIN</Text>
+            <TouchableOpacity onPress={() => setShowMapPicker(false)} style={{ padding: 8 }}>
+              <X color="#888" size={24} />
+            </TouchableOpacity>
+          </View>
+          <WebView
+            ref={pickerWebViewRef}
+            source={{ html: pickerMapHTML }}
+            style={{ flex: 1 }}
+            originWhitelist={['*']}
+            javaScriptEnabled
+            domStorageEnabled
+            onMessage={onPickerMessage}
+            scrollEnabled={false}
+          />
+        </View>
+      </Modal>
     </View>
   );
 }

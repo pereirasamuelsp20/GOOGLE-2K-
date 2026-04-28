@@ -37,6 +37,12 @@
     },
     "plugins": [
       [
+        "expo-contacts",
+        {
+          "contactsPermission": "ReliefMesh needs access to your contacts to find friends on the network."
+        }
+      ],
+      [
         "react-native-android-widget",
         {
           "widgets": [

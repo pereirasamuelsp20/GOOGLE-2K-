@@ -91,7 +91,7 @@ export default function AdminOverview() {
       const arr = [];
       if (data) {
         Object.keys(data).forEach(k => {
-          if (data[k].status === 'searching' || data[k].status === 'routed') {
+          if (data[k].status === 'searching' || data[k].status === 'routed' || data[k].status === 'responding') {
             active++;
             arr.push({ id: k, ...data[k] });
           }

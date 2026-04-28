@@ -5,6 +5,15 @@ import { collection, onSnapshot, query, where } from 'firebase/firestore';
 import { firestore } from './firebaseConfig';
 import { ORS_API_KEY } from './orsConfig';
 
+// BUG 3: Haversine distance for throttling location updates
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLng/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
 // Mumbai coordinates - hardcoded default
 const MUMBAI_LAT = 19.0760;
 const MUMBAI_LNG = 72.8777;
@@ -113,11 +122,34 @@ export default function NativeMapComponent({ userLoc, dispatchData }) {
     });
   }, [sosList, zones, userLoc, reports, importantLocations, dispatchData]);
 
-  // Send data to WebView ONLY when it is ready
+  // BUG 3: Debounce data pushes to WebView (300ms) to prevent flooding on rapid state changes
+  const debounceTimerRef = useRef(null);
+  const lastLocRef = useRef(null); // BUG 3: track last sent location for throttling
+
   useEffect(() => {
-    if (webViewReady && webViewRef.current) {
-      webViewRef.current.postMessage(buildPayload());
+    if (!webViewReady || !webViewRef.current) return;
+
+    // BUG 3: Throttle location updates — only push if moved > 10 meters
+    if (userLoc) {
+      const prev = lastLocRef.current;
+      if (prev) {
+        const dist = haversineMeters(prev.latitude, prev.longitude, userLoc.latitude, userLoc.longitude);
+        if (dist < 10) return; // Skip if location hasn't meaningfully changed
+      }
+      lastLocRef.current = userLoc;
     }
+
+    // Debounce: batch rapid state changes into a single postMessage
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    debounceTimerRef.current = setTimeout(() => {
+      if (webViewRef.current) {
+        webViewRef.current.postMessage(buildPayload());
+      }
+    }, 300);
+
+    return () => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    };
   }, [webViewReady, buildPayload]);
 
   // Handle messages FROM the WebView (including the READY handshake)
@@ -475,18 +507,8 @@ function updateMap(data){
     if(userMarker){userMarker.setLatLng([data.userLoc.lat,data.userLoc.lng])}
     else{userMarker=L.marker([data.userLoc.lat,data.userLoc.lng],{icon:createUserIcon()}).addTo(map);map.setView([data.userLoc.lat,data.userLoc.lng],14)}
   }
-  sosMarkers.forEach(function(m){map.removeLayer(m)});sosMarkers=[];
-  if(data.sosList){
-    data.sosList.forEach(function(s){
-      var c=getSOSColor(s.type);
-      var m=L.circle([s.lat,s.lng],{radius:s.type==='Medical'?300:200,color:c,fillColor:c,fillOpacity:0.35,weight:2}).addTo(map);
-      var statusText=(s.status||'active').toUpperCase();
-      m.bindPopup('<div class="popup-type" style="color:'+c+'">'+s.type+' Emergency</div><div class="popup-status">Status: '+statusText+'</div>');
-      sosMarkers.push(m);
-      var pulse=L.circleMarker([s.lat,s.lng],{radius:8,color:c,fillColor:c,fillOpacity:0.8,weight:0}).addTo(map);
-      sosMarkers.push(pulse);
-    });
-  }
+  // BUG 3: Use delta-only SOS updates instead of recreating all markers
+  if(data.sosList) updateSosDelta(data.sosList);
   zoneCircles.forEach(function(c){map.removeLayer(c)});zoneCircles=[];
   if(data.zones){
     data.zones.forEach(function(z){
@@ -496,7 +518,6 @@ function updateMap(data){
       zoneCircles.push(circle);
     });
   }
-
   // Update report markers (delta-only)
   if(data.reports){
     updateReports(data.reports);
@@ -509,6 +530,39 @@ function updateMap(data){
   }
   // Store ORS key
   if(data.orsKey) orsKey=data.orsKey;
+}
+
+// BUG 3: Delta-only SOS marker updates (cache like reports)
+var knownSosIds={};
+function updateSosDelta(sosList){
+  if(!sosList||!Array.isArray(sosList))return;
+  var incomingIds={};
+  sosList.forEach(function(s){
+    var id=s.id||s.uid;
+    if(!id)return;
+    incomingIds[id]=true;
+    var c=getSOSColor(s.type);
+    if(knownSosIds[id]){
+      // Update position if changed
+      knownSosIds[id].circle.setLatLng([s.lat,s.lng]);
+      knownSosIds[id].pulse.setLatLng([s.lat,s.lng]);
+      return;
+    }
+    // Create new markers
+    var circle=L.circle([s.lat,s.lng],{radius:s.type==='Medical'?300:200,color:c,fillColor:c,fillOpacity:0.35,weight:2}).addTo(map);
+    var statusText=(s.status||'active').toUpperCase();
+    circle.bindPopup('<div class="popup-type" style="color:'+c+'">'+s.type+' Emergency</div><div class="popup-status">Status: '+statusText+'</div>');
+    var pulse=L.circleMarker([s.lat,s.lng],{radius:8,color:c,fillColor:c,fillOpacity:0.8,weight:0}).addTo(map);
+    knownSosIds[id]={circle:circle,pulse:pulse};
+  });
+  // Remove stale
+  Object.keys(knownSosIds).forEach(function(id){
+    if(!incomingIds[id]){
+      map.removeLayer(knownSosIds[id].circle);
+      map.removeLayer(knownSosIds[id].pulse);
+      delete knownSosIds[id];
+    }
+  });
 }
 
 // ── Road Blockage zones ──
@@ -730,6 +784,9 @@ try{
         allowsBackForwardNavigationGestures={false}
         mediaPlaybackRequiresUserAction={false}
         allowsLinkPreview={false}
+        /* BUG 3: Enable hardware acceleration on Android */
+        androidLayerType="hardware"
+        androidHardwareAccelerationDisabled={false}
       />
     </View>
   );

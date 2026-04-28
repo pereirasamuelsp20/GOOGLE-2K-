@@ -59,11 +59,19 @@ router.get('/:id', async (req, res) => {
 });
 
 // PATCH /api/reports/:id/status — Update report status
+// BUG 5: Only admins can toggle status to 'Resolved'
+// TODO: Replace x-user-role header check with proper Firebase token verification in production
 router.patch('/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
     if (!status || !['Reported', 'Resolved'].includes(status)) {
       return res.status(400).json({ error: 'Status must be "Reported" or "Resolved"' });
+    }
+
+    // Server-side role enforcement: only admins can resolve reports
+    const userRole = req.headers['x-user-role'] || req.body.userRole;
+    if (status === 'Resolved' && userRole !== 'Admin') {
+      return res.status(403).json({ error: 'Only admins can resolve reports' });
     }
 
     const report = await Report.findByIdAndUpdate(
@@ -73,6 +81,7 @@ router.patch('/:id/status', async (req, res) => {
     );
 
     if (!report) return res.status(404).json({ error: 'Report not found' });
+    console.log(`[Reports] Status updated: ${req.params.id} → ${status}`);
     res.json(report);
   } catch (err) {
     console.error('PATCH /api/reports/:id/status error:', err);

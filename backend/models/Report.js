@@ -13,7 +13,11 @@ const reportSchema = new mongoose.Schema({
       'Flash Floods',
       'Car Accident',
       'Building Collapse',
-      'Chemical Leaks'
+      'Chemical Leaks',
+      'Water Logging',
+      'Gas Leak',
+      'Street Light Out',
+      'Pothole'
     ]
   },
   locationAddress: {

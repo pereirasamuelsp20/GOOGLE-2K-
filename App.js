@@ -871,7 +871,7 @@ export default function App() {
       )}
 
       {currentScreen === 'Report' && (
-        <ReportIssueScreen />
+        <ReportIssueScreen userLocation={location} userRole={userRole} />
       )}
 
       {currentScreen === 'VolunteerRole' && VolunteerRoleScreen && (

@@ -1,8 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, TextInput, TouchableOpacity, FlatList, Alert } from 'react-native';
+import { View, Text, StyleSheet, TextInput, TouchableOpacity, FlatList, Alert, SectionList, ActivityIndicator, Linking } from 'react-native';
 import { auth, firestore } from './firebaseConfig';
 import { collection, query, where, getDocs, doc, setDoc, onSnapshot, orderBy, serverTimestamp, addDoc, updateDoc } from 'firebase/firestore';
 import { encryptPayload, decryptPayload, getPrivateKey } from './utils/nativeCrypto';
+
+// BUG 2: Gracefully import expo-contacts
+let Contacts = null;
+try {
+  Contacts = require('expo-contacts');
+} catch (e) {
+  console.warn('expo-contacts not available:', e.message);
+}
 
 // Gracefully import QR code — needs react-native-svg
 let QRCode = null;
@@ -12,18 +20,22 @@ try {
   console.warn('react-native-qrcode-svg not available');
 }
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Send, QrCode, Users, WifiOff } from 'lucide-react-native';
+import { Send, QrCode, Users, WifiOff, Phone, UserPlus, Search } from 'lucide-react-native';
 
 export default function MessagesScreen() {
   const [deviceCode, setDeviceCode] = useState('');
   const [contacts, setContacts] = useState([]);
+  const [deviceContacts, setDeviceContacts] = useState([]); // BUG 2: Matched device contacts
+  const [unmatchedContacts, setUnmatchedContacts] = useState([]); // BUG 2: Unmatched device contacts
+  const [loadingContacts, setLoadingContacts] = useState(false); // BUG 2: Loading state
+  const [contactSearch, setContactSearch] = useState(''); // BUG 2: Search filter
   const [activeContact, setActiveContact] = useState(null);
   const [showAddContact, setShowAddContact] = useState(false);
   const [newContactCode, setNewContactCode] = useState('');
   
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
-  const [isOffline, setIsOffline] = useState(false); // Can be hooked to NetInfo in a full app
+  const [isOffline, setIsOffline] = useState(false);
 
   const currentUser = auth.currentUser;
   const flatListRef = useRef();
@@ -34,6 +46,7 @@ export default function MessagesScreen() {
     });
   }, []);
 
+  // Existing Firestore contacts listener
   useEffect(() => {
     if (!currentUser) return;
     const q = collection(firestore, `users/${currentUser.uid}/contacts`);
@@ -42,6 +55,101 @@ export default function MessagesScreen() {
       setContacts(c);
     });
     return () => unsub();
+  }, [currentUser]);
+
+  // BUG 2: Fetch device contacts and match against Firestore users
+  useEffect(() => {
+    if (!currentUser || !Contacts) return;
+    
+    const fetchDeviceContacts = async () => {
+      try {
+        setLoadingContacts(true);
+        const { status } = await Contacts.requestPermissionsAsync();
+        if (status !== 'granted') {
+          console.warn('Contacts permission denied');
+          setLoadingContacts(false);
+          return;
+        }
+
+        const { data } = await Contacts.getContactsAsync({
+          fields: [Contacts.Fields.PhoneNumbers, Contacts.Fields.Name],
+          sort: Contacts.SortTypes.FirstName,
+        });
+
+        if (!data || data.length === 0) {
+          setLoadingContacts(false);
+          return;
+        }
+
+        // Extract all phone numbers from device contacts
+        const phoneMap = {}; // phone -> contact
+        data.forEach(contact => {
+          if (contact.phoneNumbers) {
+            contact.phoneNumbers.forEach(pn => {
+              // Normalize phone number (remove spaces, dashes)
+              const normalized = pn.number?.replace(/[\s\-()]/g, '') || '';
+              if (normalized.length >= 10) {
+                phoneMap[normalized] = {
+                  name: contact.name || contact.firstName || 'Unknown',
+                  phone: pn.number,
+                  normalizedPhone: normalized,
+                };
+              }
+            });
+          }
+        });
+
+        const phoneNumbers = Object.keys(phoneMap);
+        if (phoneNumbers.length === 0) {
+          setLoadingContacts(false);
+          return;
+        }
+
+        // Query Firestore users in batches of 10 (Firestore 'in' query limit)
+        const matched = [];
+        const matchedPhones = new Set();
+        for (let i = 0; i < phoneNumbers.length; i += 10) {
+          const batch = phoneNumbers.slice(i, i + 10);
+          try {
+            const q = query(collection(firestore, 'users'), where('phoneNumber', 'in', batch));
+            const snap = await getDocs(q);
+            snap.forEach(d => {
+              const userData = d.data();
+              if (d.id !== currentUser.uid) {
+                const contactInfo = phoneMap[userData.phoneNumber] || {};
+                matched.push({
+                  id: d.id,
+                  uid: d.id,
+                  name: userData.displayName || contactInfo.name || 'User',
+                  deviceCode: userData.deviceCode || '',
+                  publicKey: userData.publicKey || '',
+                  phoneNumber: userData.phoneNumber,
+                  localName: contactInfo.name, // Name from device
+                  source: 'device',
+                });
+                matchedPhones.add(userData.phoneNumber);
+              }
+            });
+          } catch (e) {
+            // Batch query failed, continue
+          }
+        }
+
+        setDeviceContacts(matched);
+
+        // Build unmatched list (device contacts not on ReliefMesh)
+        const unmatched = Object.values(phoneMap)
+          .filter(c => !matchedPhones.has(c.normalizedPhone))
+          .slice(0, 30); // Limit to 30 for performance
+        setUnmatchedContacts(unmatched);
+        setLoadingContacts(false);
+      } catch (e) {
+        console.warn('Device contacts fetch failed:', e.message);
+        setLoadingContacts(false);
+      }
+    };
+
+    fetchDeviceContacts();
   }, [currentUser]);
 
   useEffect(() => {
@@ -157,14 +265,61 @@ export default function MessagesScreen() {
     );
   };
 
+  // BUG 2: Handle tapping a device contact (auto-add to Firestore contacts)
+  const handleDeviceContactTap = async (contact) => {
+    try {
+      // Add to Firestore contacts subcollection if not already there
+      const existingContact = contacts.find(c => c.uid === contact.uid);
+      if (!existingContact) {
+        await setDoc(doc(firestore, `users/${currentUser.uid}/contacts`, contact.uid), {
+          uid: contact.uid,
+          name: contact.localName || contact.name,
+          deviceCode: contact.deviceCode,
+          publicKey: contact.publicKey,
+          phoneNumber: contact.phoneNumber,
+          source: 'device',
+          addedAt: serverTimestamp()
+        });
+      }
+      setActiveContact(contact);
+    } catch (e) {
+      Alert.alert('Error', 'Failed to start chat: ' + e.message);
+    }
+  };
+
+  // BUG 2: Invite unmatched contact via SMS
+  const handleInviteContact = (contact) => {
+    const message = `Hey! Join me on ReliefMesh for emergency response and mesh networking. Download: https://reliefmesh.app`;
+    const url = `sms:${contact.phone}?body=${encodeURIComponent(message)}`;
+    Linking.openURL(url).catch(() => {
+      Alert.alert('Invite Sent', `Ask ${contact.name} to join ReliefMesh!`);
+    });
+  };
+
+  // BUG 2: Combine all contacts and filter by search
+  const allContacts = [
+    ...contacts.map(c => ({ ...c, source: c.source || 'mesh' })),
+    ...deviceContacts.filter(dc => !contacts.find(c => c.uid === dc.uid)),
+  ];
+
+  const filteredContacts = contactSearch
+    ? allContacts.filter(c => (c.name || '').toLowerCase().includes(contactSearch.toLowerCase()))
+    : allContacts;
+
+  const filteredUnmatched = contactSearch
+    ? unmatchedContacts.filter(c => (c.name || '').toLowerCase().includes(contactSearch.toLowerCase()))
+    : unmatchedContacts;
+
   if (!activeContact && !showAddContact) {
     return (
       <View style={styles.container}>
         <View style={styles.header}>
           <Text style={styles.headerTitle}>Contacts</Text>
-          <TouchableOpacity onPress={() => setShowAddContact(true)}>
-            <QrCode color="#dc2626" size={24} />
-          </TouchableOpacity>
+          <View style={{ flexDirection: 'row', gap: 12 }}>
+            <TouchableOpacity onPress={() => setShowAddContact(true)}>
+              <QrCode color="#dc2626" size={24} />
+            </TouchableOpacity>
+          </View>
         </View>
         
         {isOffline && (
@@ -174,21 +329,90 @@ export default function MessagesScreen() {
           </View>
         )}
 
+        {/* BUG 2: Search bar */}
+        <View style={{ paddingHorizontal: 15, paddingTop: 10, paddingBottom: 5 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#1f1f2e', borderRadius: 10, paddingHorizontal: 12 }}>
+            <Search color="#555" size={16} />
+            <TextInput
+              style={{ flex: 1, color: '#fff', padding: 10, fontSize: 14 }}
+              placeholder="Search contacts..."
+              placeholderTextColor="#555"
+              value={contactSearch}
+              onChangeText={setContactSearch}
+            />
+          </View>
+        </View>
+
+        {loadingContacts && (
+          <View style={{ padding: 20, alignItems: 'center' }}>
+            <ActivityIndicator size="small" color="#dc2626" />
+            <Text style={{ color: '#888', fontSize: 12, marginTop: 8 }}>Syncing device contacts...</Text>
+          </View>
+        )}
+
         <FlatList
-          data={contacts}
-          keyExtractor={c => c.id}
-          renderItem={({ item }) => (
-            <TouchableOpacity style={styles.contactRow} onPress={() => setActiveContact(item)}>
-              <View style={styles.avatar}>
-                <Text style={styles.avatarText}>{item.name.substring(0,2).toUpperCase()}</Text>
-              </View>
-              <View>
-                <Text style={styles.contactName}>{item.name}</Text>
-                <Text style={styles.contactCode}>{item.deviceCode.substring(0,8)}...</Text>
-              </View>
-            </TouchableOpacity>
-          )}
-          ListEmptyComponent={<Text style={{ color: '#888', textAlign: 'center', marginTop: 20 }}>No contacts yet.</Text>}
+          data={[
+            ...(filteredContacts.length > 0 ? [{ type: 'section', title: `RELIEFMESH CONTACTS (${filteredContacts.length})` }] : []),
+            ...filteredContacts.map(c => ({ type: 'contact', ...c })),
+            ...(filteredUnmatched.length > 0 ? [{ type: 'section', title: `INVITE TO RELIEFMESH (${filteredUnmatched.length})` }] : []),
+            ...filteredUnmatched.map(c => ({ type: 'unmatched', ...c })),
+          ]}
+          keyExtractor={(item, i) => item.id || item.normalizedPhone || `section-${i}`}
+          renderItem={({ item }) => {
+            if (item.type === 'section') {
+              return (
+                <View style={{ paddingHorizontal: 15, paddingTop: 16, paddingBottom: 6 }}>
+                  <Text style={{ color: '#555', fontSize: 10, fontWeight: '800', letterSpacing: 1.5 }}>{item.title}</Text>
+                </View>
+              );
+            }
+            if (item.type === 'unmatched') {
+              return (
+                <View style={[styles.contactRow, { opacity: 0.6 }]}>
+                  <View style={[styles.avatar, { backgroundColor: '#1a1a2a' }]}>
+                    <Phone color="#555" size={16} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.contactName, { color: '#888' }]}>{item.name}</Text>
+                    <Text style={styles.contactCode}>{item.phone}</Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => handleInviteContact(item)}
+                    style={{ backgroundColor: 'rgba(220,38,38,0.1)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8, flexDirection: 'row', alignItems: 'center', gap: 4 }}
+                  >
+                    <UserPlus color="#dc2626" size={12} />
+                    <Text style={{ color: '#dc2626', fontSize: 11, fontWeight: '700' }}>Invite</Text>
+                  </TouchableOpacity>
+                </View>
+              );
+            }
+            return (
+              <TouchableOpacity
+                style={styles.contactRow}
+                onPress={() => item.source === 'device' ? handleDeviceContactTap(item) : setActiveContact(item)}
+              >
+                <View style={[styles.avatar, item.source === 'device' && { borderWidth: 1, borderColor: '#22c55e40' }]}>
+                  <Text style={styles.avatarText}>{(item.name || '??').substring(0,2).toUpperCase()}</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.contactName}>{item.localName || item.name}</Text>
+                  <Text style={styles.contactCode}>
+                    {item.source === 'device' ? '📱 From contacts' : (item.deviceCode ? item.deviceCode.substring(0,8) + '...' : 'Mesh user')}
+                  </Text>
+                </View>
+                {item.source === 'device' && (
+                  <View style={{ backgroundColor: 'rgba(34,197,94,0.1)', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}>
+                    <Text style={{ color: '#22c55e', fontSize: 9, fontWeight: '700' }}>PHONE</Text>
+                  </View>
+                )}
+              </TouchableOpacity>
+            );
+          }}
+          ListEmptyComponent={
+            !loadingContacts ? (
+              <Text style={{ color: '#888', textAlign: 'center', marginTop: 40 }}>No contacts yet. Add via QR code or sync your phone contacts.</Text>
+            ) : null
+          }
         />
       </View>
     );

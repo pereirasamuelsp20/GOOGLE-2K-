@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MapContainer, TileLayer, Marker, Popup, useMapEvents, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Circle, useMapEvents, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft } from 'lucide-react';
+import { auth, db } from '../firebase';
+import { doc, onSnapshot } from 'firebase/firestore';
 
 const API_BASE = 'http://localhost:4000/api';
 
@@ -86,13 +88,19 @@ const submitReport = async (payload) => {
 };
 
 // Update report status
-const updateStatus = async ({ id, status }) => {
+const updateStatus = async ({ id, status, userRole }) => {
   const res = await fetch(`${API_BASE}/reports/${id}/status`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-user-role': userRole || 'Citizen', // BUG 5: send role to server
+    },
     body: JSON.stringify({ status }),
   });
-  if (!res.ok) throw new Error('Failed to update status');
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody.error || 'Failed to update status');
+  }
   return res.json();
 };
 
@@ -111,6 +119,10 @@ export default function ReportIssue() {
   const [details, setDetails] = useState('');
   const [toast, setToast] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  const [currentUserRole, setCurrentUserRole] = useState('Citizen'); // BUG 5
+  const [showRadiusCircle, setShowRadiusCircle] = useState(false); // BUG 1
+  const [userGPS, setUserGPS] = useState(null); // BUG 1
+  const [fetchingGPS, setFetchingGPS] = useState(false); // BUG 1
 
   const dropdownRef = useRef(null);
 
@@ -124,6 +136,57 @@ export default function ReportIssue() {
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, []);
+
+  // BUG 5: Fetch current user's role from Firestore
+  useEffect(() => {
+    const user = auth.currentUser;
+    if (!user) return;
+    const unsub = onSnapshot(doc(db, 'users', user.uid), (snap) => {
+      if (snap.exists()) {
+        setCurrentUserRole(snap.data().role || 'Citizen');
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // BUG 1: Auto-fetch GPS for non-road-blocked issues
+  useEffect(() => {
+    if (calamityType && calamityType !== 'Road Blocked') {
+      setFetchingGPS(true);
+      setShowRadiusCircle(false);
+      navigator.geolocation?.getCurrentPosition(
+        (pos) => {
+          const { latitude, longitude } = pos.coords;
+          setLat(latitude);
+          setLng(longitude);
+          setPinPlaced(true);
+          setUserGPS({ lat: latitude, lng: longitude });
+          reverseGeocode(latitude, longitude);
+          setFetchingGPS(false);
+        },
+        (err) => {
+          console.warn('GPS error:', err.message);
+          setFetchingGPS(false);
+        },
+        { enableHighAccuracy: true, timeout: 8000 }
+      );
+    } else if (calamityType === 'Road Blocked') {
+      // Show radius circle if we have GPS
+      setFetchingGPS(true);
+      navigator.geolocation?.getCurrentPosition(
+        (pos) => {
+          const { latitude, longitude } = pos.coords;
+          setLat(latitude);
+          setLng(longitude);
+          setUserGPS({ lat: latitude, lng: longitude });
+          setShowRadiusCircle(true);
+          setFetchingGPS(false);
+        },
+        () => setFetchingGPS(false),
+        { enableHighAccuracy: true, timeout: 8000 }
+      );
+    }
+  }, [calamityType]);
 
   // Fetch reports via React Query
   const { data: reports = [], isLoading: reportsLoading } = useQuery({
@@ -154,6 +217,10 @@ export default function ReportIssue() {
     mutationFn: updateStatus,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['reports'] });
+      showToast('Status updated!', 'success');
+    },
+    onError: (err) => {
+      showToast(`Error: ${err.message}`, 'error');
     }
   });
 
@@ -221,12 +288,51 @@ export default function ReportIssue() {
     geocodeAddress(val);
   };
 
-  const handleMapClick = (clickLat, clickLng) => {
+  const handleMapClick = async (clickLat, clickLng) => {
+    // BUG 1: If Road Blocked with radius circle, enforce 100m + road-snap
+    if (calamityType === 'Road Blocked' && showRadiusCircle && userGPS) {
+      const dist = haversineDistance(userGPS.lat, userGPS.lng, clickLat, clickLng);
+      if (dist > 100) {
+        showToast('Please place the pin within the 100m radius', 'error');
+        return;
+      }
+      // Snap to nearest road via Overpass API
+      try {
+        const query = `[out:json];way(around:50,${clickLat},${clickLng})["highway"];out geom;`;
+        const res = await fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: query });
+        const data = await res.json();
+        if (data.elements && data.elements.length > 0) {
+          let bestDist = Infinity, bestPt = null;
+          data.elements.forEach(el => {
+            if (!el.geometry) return;
+            el.geometry.forEach(pt => {
+              const d = haversineDistance(clickLat, clickLng, pt.lat, pt.lon);
+              if (d < bestDist) { bestDist = d; bestPt = { lat: pt.lat, lng: pt.lon }; }
+            });
+          });
+          if (bestPt && haversineDistance(userGPS.lat, userGPS.lng, bestPt.lat, bestPt.lng) <= 100) {
+            clickLat = bestPt.lat;
+            clickLng = bestPt.lng;
+          }
+        }
+      } catch (e) {
+        console.warn('Road snap failed:', e.message);
+      }
+    }
     setLat(clickLat);
     setLng(clickLng);
     setPinPlaced(true);
     reverseGeocode(clickLat, clickLng);
   };
+
+  // BUG 1: Haversine distance helper (meters)
+  function haversineDistance(lat1, lng1, lat2, lng2) {
+    const R = 6371000;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLng/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
 
   const handleSubmit = () => {
     if (!calamityType) {
@@ -333,6 +439,15 @@ export default function ReportIssue() {
                     </Popup>
                   </Marker>
                 ))}
+
+                {/* BUG 1: 100m radius circle for Road Blocked */}
+                {showRadiusCircle && userGPS && (
+                  <Circle
+                    center={[userGPS.lat, userGPS.lng]}
+                    radius={100}
+                    pathOptions={{ color: '#CC0000', fillColor: '#CC0000', fillOpacity: 0.12, weight: 2, dashArray: '6,4' }}
+                  />
+                )}
               </MapContainer>
             </div>
 
@@ -451,18 +566,31 @@ export default function ReportIssue() {
                       <span className="ri-report-icon">{getCalamityIcon(r.calamityType)}</span>
                       <span className="ri-report-type-label">{r.calamityType}</span>
                     </div>
-                    <button
-                      className={`ri-status-badge ${r.status === 'Resolved' ? 'resolved' : 'reported'}`}
-                      onClick={() =>
-                        statusMutation.mutate({
-                          id: r._id,
-                          status: r.status === 'Reported' ? 'Resolved' : 'Reported'
-                        })
-                      }
-                      title="Click to toggle status"
-                    >
-                      {r.status}
-                    </button>
+                    {/* BUG 5: Only admins can toggle status. BUG 6: loading state */}
+                    {currentUserRole === 'Admin' ? (
+                      <button
+                        className={`ri-status-badge ${r.status === 'Resolved' ? 'resolved' : 'reported'}`}
+                        onClick={() =>
+                          statusMutation.mutate({
+                            id: r._id,
+                            status: r.status === 'Reported' ? 'Resolved' : 'Reported',
+                            userRole: currentUserRole,
+                          })
+                        }
+                        title="Click to toggle status"
+                        disabled={statusMutation.isPending}
+                        style={{ opacity: statusMutation.isPending ? 0.6 : 1 }}
+                      >
+                        {statusMutation.isPending ? '...' : r.status}
+                      </button>
+                    ) : (
+                      <span
+                        className={`ri-status-badge ${r.status === 'Resolved' ? 'resolved' : 'reported'}`}
+                        title="Only admins can change status"
+                      >
+                        {r.status}
+                      </span>
+                    )}
                   </div>
 
                   <div className="ri-report-address">

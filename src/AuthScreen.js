@@ -15,9 +15,13 @@ import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   GoogleAuthProvider,
-  signInWithPopup
+  signInWithPopup,
+  PhoneAuthProvider,
+  RecaptchaVerifier,
+  linkWithCredential
 } from 'firebase/auth';
-import { auth } from './firebaseConfig';
+import { auth, firestore } from './firebaseConfig';
+import { doc, setDoc, getDoc } from 'firebase/firestore';
 import Svg, { Path } from 'react-native-svg';
 
 const TabSwitcher = ({ tabs, activeTab, onTabChange }) => {
@@ -113,8 +117,13 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
+  const [phoneNumber, setPhoneNumber] = useState(''); // BUG 2: Phone number
   const [role, setRole] = useState('Citizen');
   const [errorMsg, setErrorMsg] = useState('');
+  const [verificationId, setVerificationId] = useState(null); // BUG 2: OTP flow
+  const [otpCode, setOtpCode] = useState(''); // BUG 2: OTP code
+  const [showOtpModal, setShowOtpModal] = useState(false); // BUG 2: OTP modal
+  const [pendingUser, setPendingUser] = useState(null); // BUG 2: user awaiting phone link
 
   const fadeAnim = useRef(new Animated.Value(1)).current;
   const slideAnim = useRef(new Animated.Value(0)).current;
@@ -186,23 +195,66 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
         onAuthSuccess(cred.user, false);
       } else {
         const cred = await createUserWithEmailAndPassword(auth, email, password);
-        // Save user profile — role is limited to Citizen/Volunteer/Responder (no Admin self-signup)
+        // Save user profile with phone number
         try {
-          const { doc, setDoc } = require('firebase/firestore');
-          const { firestore } = require('./firebaseConfig');
           await setDoc(doc(firestore, 'users', cred.user.uid), {
             displayName: fullName || email.split('@')[0],
             email,
             role,
+            phoneNumber: phoneNumber || null, // BUG 2: Store phone
+            phoneVerified: false,
             createdAt: new Date(),
           }, { merge: true });
         } catch (e) {
           console.warn('Failed to save user role (non-fatal):', e.message);
         }
+
+        // BUG 2: If phone number provided, initiate verification
+        if (phoneNumber && Platform.OS === 'web') {
+          try {
+            // Web-only reCAPTCHA-based phone auth
+            if (!window.recaptchaVerifier) {
+              window.recaptchaVerifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
+                size: 'invisible',
+              });
+            }
+            const provider = new PhoneAuthProvider(auth);
+            const vId = await provider.verifyPhoneNumber(phoneNumber, window.recaptchaVerifier);
+            setVerificationId(vId);
+            setPendingUser(cred.user);
+            setShowOtpModal(true);
+            return; // Don't call onAuthSuccess yet — wait for OTP
+          } catch (phoneErr) {
+            console.warn('Phone verification failed (non-fatal):', phoneErr.message);
+            // Continue without phone verification
+          }
+        }
+
         onAuthSuccess(cred.user, true);
       }
     } catch (err) {
       setErrorMsg(err.message);
+    }
+  };
+
+  // BUG 2: Verify OTP and link phone credential
+  const handleVerifyOtp = async () => {
+    try {
+      setErrorMsg('');
+      const credential = PhoneAuthProvider.credential(verificationId, otpCode);
+      if (pendingUser) {
+        await linkWithCredential(pendingUser, credential);
+        // Mark phone as verified in Firestore
+        await setDoc(doc(firestore, 'users', pendingUser.uid), {
+          phoneVerified: true,
+        }, { merge: true });
+      }
+      setShowOtpModal(false);
+      setOtpCode('');
+      setVerificationId(null);
+      onAuthSuccess(pendingUser, true);
+    } catch (err) {
+      setErrorMsg('Invalid OTP: ' + err.message);
     }
   };
 
@@ -213,8 +265,6 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
         const cred = await signInWithPopup(auth, provider);
         // Create user doc if first time
         try {
-          const { doc, setDoc, getDoc } = require('firebase/firestore');
-          const { firestore } = require('./firebaseConfig');
           const userDoc = await getDoc(doc(firestore, 'users', cred.user.uid));
           if (!userDoc.exists()) {
             await setDoc(doc(firestore, 'users', cred.user.uid), {
@@ -345,6 +395,21 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
               </View>
             )}
 
+            {/* BUG 2: Phone number input (Sign Up only) */}
+            {activeTab === 'Sign up' && (
+              <View style={styles.inputGroup}>
+                <Text style={styles.label}>Phone number <Text style={{ color: '#555', fontSize: 11 }}>(optional)</Text></Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="+91 XXXXX XXXXX"
+                  placeholderTextColor="#4a4a5a"
+                  keyboardType="phone-pad"
+                  value={phoneNumber}
+                  onChangeText={setPhoneNumber}
+                />
+              </View>
+            )}
+
             <View style={styles.buttonWrapper}>
               <AnimatedButton
                 title={activeTab === 'Sign in' ? 'Sign in to ReliefMesh' : 'Create account'}
@@ -389,6 +454,37 @@ export default function AuthScreen({ onAuthSuccess, onSkipAuth }) {
         </View>
 
       </View>
+
+      {/* BUG 2: OTP Verification Modal */}
+      {showOtpModal && (
+        <View style={styles.otpOverlay}>
+          <View style={styles.otpCard}>
+            <Text style={{ color: '#fff', fontSize: 20, fontWeight: '800', marginBottom: 8 }}>Verify Phone</Text>
+            <Text style={{ color: '#888', fontSize: 13, marginBottom: 20, lineHeight: 18 }}>
+              Enter the 6-digit code sent to {phoneNumber}
+            </Text>
+            {errorMsg ? <Text style={styles.errorText}>{errorMsg}</Text> : null}
+            <TextInput
+              style={[styles.input, { textAlign: 'center', fontSize: 24, letterSpacing: 8 }]}
+              placeholder="000000"
+              placeholderTextColor="#4a4a5a"
+              keyboardType="number-pad"
+              maxLength={6}
+              value={otpCode}
+              onChangeText={setOtpCode}
+            />
+            <View style={{ marginTop: 16 }}>
+              <AnimatedButton title="Verify" onPress={handleVerifyOtp} type="primary" />
+            </View>
+            <TouchableOpacity onPress={() => { setShowOtpModal(false); onAuthSuccess(pendingUser, true); }} style={{ marginTop: 12, alignItems: 'center' }}>
+              <Text style={{ color: '#888', fontSize: 13 }}>Skip verification →</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {/* Invisible reCAPTCHA container (web only) */}
+      {Platform.OS === 'web' && <View nativeID="recaptcha-container" />}
     </View>
   );
 }
@@ -636,5 +732,23 @@ const styles = StyleSheet.create({
     color: '#6a6a7a',
     fontSize: 11,
     fontWeight: '500',
-  }
+  },
+  // BUG 2: OTP modal styles
+  otpOverlay: {
+    position: 'absolute',
+    top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.85)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 9999,
+  },
+  otpCard: {
+    backgroundColor: '#13131a',
+    borderWidth: 1,
+    borderColor: '#2a2a3a',
+    borderRadius: 20,
+    padding: 28,
+    width: '85%',
+    maxWidth: 380,
+  },
 });
