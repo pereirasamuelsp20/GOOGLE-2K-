@@ -12,9 +12,9 @@ import CommunityScreen from './CommunityScreen';
 
 // Inline LiveSOS + Responders from old AdminLayout (kept compact)
 import { collection, onSnapshot, query, where, doc, updateDoc } from 'firebase/firestore';
-import { ref, onValue, update } from 'firebase/database';
+import { ref, onValue, update, remove } from 'firebase/database';
 import { db, rtdb } from '../firebase';
-import { MapContainer, TileLayer, Marker, Popup, ZoomControl } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, ZoomControl, Polyline } from 'react-leaflet';
 import { useQuery } from '@tanstack/react-query';
 import L from 'leaflet';
 import { useState, useEffect } from 'react';
@@ -36,7 +36,7 @@ function LiveSos() {
       const arr = [];
       if (data) {
         Object.keys(data).forEach(k => {
-          if (data[k].status === 'searching' || data[k].status === 'routed') {
+          if (data[k].status === 'searching' || data[k].status === 'routed' || data[k].status === 'responding') {
             arr.push({ id: k, ...data[k] });
           }
         });
@@ -58,6 +58,17 @@ function LiveSos() {
       await update(ref(rtdb, `sos/${sos.id}`), { status: 'routed', teamId: team.id });
       await updateDoc(doc(db, 'teams', team.id), { status: 'dispatched', dispatchedSosId: sos.id });
     } catch (e) { alert('Dispatch failed: ' + e.message); }
+  };
+
+  const handleCancelSOS = async (sos) => {
+    if (!window.confirm(`Cancel SOS #${sos.id.substring(0,10)}? This will reset the assigned team.`)) return;
+    try {
+      await update(ref(rtdb, `sos/${sos.id}`), { status: 'cancelled' });
+      try { await remove(ref(rtdb, `dispatch/${sos.id}`)); } catch(e) {}
+      if (sos.teamId) {
+        try { await updateDoc(doc(db, 'teams', sos.teamId), { status: 'ready', dispatchedSosId: null }); } catch(e) {}
+      }
+    } catch (e) { alert('Cancel failed: ' + e.message); }
   };
 
   return (
@@ -86,7 +97,7 @@ function LiveSos() {
               </span>
             </div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              {teams.map(t => (
+              {sos.status === 'searching' && teams.map(t => (
                 <button key={t.id} onClick={() => handleDispatchTeam(sos, t)} style={{
                   background: 'var(--primary-red)', color: 'white', border: 'none',
                   padding: '8px 16px', borderRadius: 8, cursor: 'pointer', fontWeight: 600, fontSize: 12
@@ -94,7 +105,13 @@ function LiveSos() {
                   Dispatch {t.name}
                 </button>
               ))}
-              {teams.length === 0 && <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>No teams ready</span>}
+              {sos.status === 'searching' && teams.length === 0 && <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>No teams ready</span>}
+              <button onClick={() => handleCancelSOS(sos)} style={{
+                background: 'rgba(220,38,38,0.1)', color: '#dc2626', border: '1px solid rgba(220,38,38,0.3)',
+                padding: '8px 16px', borderRadius: 8, cursor: 'pointer', fontWeight: 600, fontSize: 12
+              }}>
+                Cancel SOS
+              </button>
             </div>
           </div>
         ))}
@@ -186,12 +203,40 @@ const landmarkIcon = L.divIcon({
   iconSize: [8, 8], iconAnchor: [4, 4],
 });
 
-// Mesh Map page (full map with SOS + issues + important locations)
+// Issue type → icon/color mapping for map markers
+const ISSUE_ICONS = {
+  'Earthquakes': '🌍', 'Landslides': '🏔', 'Power Outages': '⚡', 'Fire': '🔥',
+  'Road Blocked': '🚧', 'Flash Floods': '🌊', 'Car Accident': '🚗',
+  'Building Collapse': '🏗', 'Chemical Leaks': '☣',
+  'Water Logging': '🌊', 'Gas Leak': '☣', 'Street Light Out': '💡', 'Pothole': '🕳',
+};
+const ISSUE_COLORS = {
+  'Earthquakes': '#f97316', 'Landslides': '#a16207', 'Power Outages': '#eab308', 'Fire': '#dc2626',
+  'Road Blocked': '#f59e0b', 'Flash Floods': '#3b82f6', 'Car Accident': '#ef4444',
+  'Building Collapse': '#78716c', 'Chemical Leaks': '#a855f7',
+  'Water Logging': '#0ea5e9', 'Gas Leak': '#a855f7', 'Street Light Out': '#eab308', 'Pothole': '#78716c',
+};
+
+function createIssueIcon(type) {
+  const c = ISSUE_COLORS[type] || '#f59e0b';
+  const ic = ISSUE_ICONS[type] || '⚠';
+  return L.divIcon({
+    className: '',
+    html: `<svg width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="${c}" stroke="#fff" stroke-width="2" opacity="0.9"/><text x="16" y="17" text-anchor="middle" dominant-baseline="central" font-size="14">${ic}</text></svg>`,
+    iconSize: [32, 32], iconAnchor: [16, 16], popupAnchor: [0, -18]
+  });
+}
+
+// Mesh Map page (full map with SOS + issues + important locations + vehicle tracking)
 function AdminMeshMap() {
   const [sosList, setSosList] = useState([]);
+  const [issues, setIssues] = useState([]);
+  const [dispatches, setDispatches] = useState([]);
+  const [resolvingId, setResolvingId] = useState(null);
   const [locationFilters, setLocationFilters] = useState({
     hospital: true, fire_station: true, police: true, shelter: true,
   });
+  const [showIssues, setShowIssues] = useState(true);
 
   useEffect(() => {
     const uS = onValue(ref(rtdb, 'sos'), snap => {
@@ -200,8 +245,72 @@ function AdminMeshMap() {
       if (data) Object.keys(data).forEach(k => arr.push({ id: k, ...data[k] }));
       setSosList(arr);
     });
-    return () => uS();
+    // Listen for active dispatches (vehicle tracking)
+    const uD = onValue(ref(rtdb, 'dispatch'), snap => {
+      const data = snap.val();
+      const arr = [];
+      const now = Date.now();
+      if (data) Object.keys(data).forEach(k => {
+        const d = { id: k, ...data[k] };
+        // Auto-cleanup stale dispatches (arrived/completed or older than 30 min)
+        const age = now - (d.timestamp || 0);
+        if (d.progress >= 1 || age > 30 * 60 * 1000) {
+          try { remove(ref(rtdb, `dispatch/${k}`)); } catch(e) {}
+          return; // Don't show stale entries
+        }
+        arr.push(d);
+      });
+      setDispatches(arr);
+    });
+    return () => { uS(); uD(); };
   }, []);
+
+  // Fetch reported issues from backend and poll every 5s
+  useEffect(() => {
+    const fetchIssues = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/reports`);
+        if (res.ok) {
+          const data = await res.json();
+          setIssues(data);
+        }
+      } catch (e) {
+        console.warn('Failed to fetch issues for map:', e.message);
+      }
+    };
+    fetchIssues();
+    const interval = setInterval(fetchIssues, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Resolve an issue from the map popup
+  const handleResolveIssue = async (id) => {
+    setResolvingId(id);
+    try {
+      const res = await fetch(`${API_BASE}/reports/${id}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'Resolved' }),
+      });
+      if (res.ok) {
+        // Immediately remove from local state
+        setIssues(prev => prev.filter(r => r._id !== id));
+      }
+    } catch (e) {
+      console.warn('Failed to resolve issue:', e.message);
+    } finally {
+      setResolvingId(null);
+    }
+  };
+
+  const formatIssueTime = (dateStr) => {
+    const d = new Date(dateStr);
+    const day = String(d.getDate()).padStart(2, '0');
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const hours = String(d.getHours()).padStart(2, '0');
+    const mins = String(d.getMinutes()).padStart(2, '0');
+    return `${day} ${months[d.getMonth()]} ${d.getFullYear()}, ${hours}:${mins}`;
+  };
 
   // Fetch important locations
   const { data: importantLocations = FALLBACK_LOCATIONS } = useQuery({
@@ -226,6 +335,44 @@ function AdminMeshMap() {
               <strong>{sos.type}</strong><br />
               Status: {sos.status}<br />
               {sos.teamId && <>Team: {sos.teamId}<br /></>}
+            </Popup>
+          </Marker>
+        ))}
+        {/* Reported Issues */}
+        {showIssues && issues.filter(r => r.latitude && r.longitude).map((issue) => (
+          <Marker key={issue._id} position={[issue.latitude, issue.longitude]} icon={createIssueIcon(issue.calamityType)}>
+            <Popup>
+              <div style={{ minWidth: 220, color: '#fff' }}>
+                <div style={{ fontWeight: 800, fontSize: 15, color: ISSUE_COLORS[issue.calamityType] || '#f59e0b', marginBottom: 6 }}>
+                  {ISSUE_ICONS[issue.calamityType] || '⚠'} {issue.calamityType}
+                </div>
+                <div style={{ color: '#bbb', fontSize: 12, lineHeight: 1.5, marginBottom: 6 }}>
+                  {issue.locationAddress}
+                </div>
+                {issue.details && (
+                  <div style={{ color: '#999', fontSize: 11, fontStyle: 'italic', marginBottom: 6 }}>
+                    "{issue.details}"
+                  </div>
+                )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#888', fontSize: 11, marginBottom: 6 }}>
+                  <span>🕐</span> {formatIssueTime(issue.createdAt)}
+                </div>
+                <div style={{ color: '#888', fontSize: 11, marginBottom: 10 }}>
+                  Reported by: {issue.reportedBy || 'anonymous'}
+                </div>
+                <button
+                  onClick={() => handleResolveIssue(issue._id)}
+                  disabled={resolvingId === issue._id}
+                  style={{
+                    width: '100%', padding: '8px 0', borderRadius: 8, border: 'none',
+                    background: resolvingId === issue._id ? '#333' : '#22c55e',
+                    color: '#fff', fontWeight: 700, fontSize: 12, cursor: 'pointer',
+                    letterSpacing: 0.5,
+                  }}
+                >
+                  {resolvingId === issue._id ? 'Resolving...' : '✓ Mark Resolved'}
+                </button>
+              </div>
             </Popup>
           </Marker>
         ))}
@@ -257,14 +404,64 @@ function AdminMeshMap() {
             </Popup>
           </Marker>
         ))}
+        {/* Dispatched Vehicle Markers + Route Polylines */}
+        {dispatches.filter(d => d.vehiclePos).map(d => {
+          const vehicleIcon = L.divIcon({
+            className: '',
+            html: `<div style="font-size:28px;filter:drop-shadow(0 2px 6px rgba(0,0,0,0.5));animation:vehiclePulse 1.5s ease-in-out infinite">${d.vehicleIcon || '🚨'}</div>`,
+            iconSize: [32, 32], iconAnchor: [16, 16]
+          });
+          return (
+            <React.Fragment key={'dispatch-' + d.id}>
+              <Marker position={[d.vehiclePos.lat, d.vehiclePos.lng]} icon={vehicleIcon}>
+                <Popup>
+                  <div style={{ color: '#fff', minWidth: 180 }}>
+                    <div style={{ fontWeight: 800, fontSize: 14, color: '#3b82f6', marginBottom: 4 }}>
+                      {d.vehicleIcon || '🚨'} {d.facilityName || 'Responding'}
+                    </div>
+                    <div style={{ color: '#888', fontSize: 11, marginBottom: 4 }}>ETA: {d.eta || '--'}</div>
+                    <div style={{ color: '#888', fontSize: 11 }}>Progress: {Math.round((d.progress || 0) * 100)}%</div>
+                  </div>
+                </Popup>
+              </Marker>
+              {d.route && d.route.length > 1 && (
+                <Polyline positions={d.route} pathOptions={{ color: '#3b82f6', weight: 4, opacity: 0.6, dashArray: '10,8' }} />
+              )}
+              {d.facilityLat && d.facilityLng && (
+                <Marker position={[d.facilityLat, d.facilityLng]} icon={L.divIcon({
+                  className: '',
+                  html: '<div style="width:16px;height:16px;background:#3b82f6;border-radius:50%;border:3px solid white;box-shadow:0 0 12px rgba(59,130,246,0.6)"></div>',
+                  iconSize: [16, 16], iconAnchor: [8, 8]
+                })}>
+                  <Popup><div style={{ color: '#fff' }}><strong>🚨 {d.facilityName}</strong><br/>Vehicle Dispatched</div></Popup>
+                </Marker>
+              )}
+            </React.Fragment>
+          );
+        })}
       </MapContainer>
+      {/* Dispatched Vehicle Markers + Routes */}
+      {/* Note: These are rendered inside MapContainer above via the list below */}
       {/* Legend */}
       <div style={{ position: 'absolute', top: 16, left: 16, background: 'rgba(13,13,20,0.9)', backdropFilter: 'blur(10px)', border: '1px solid var(--border-color)', borderRadius: 12, padding: '10px 18px', zIndex: 1000, display: 'flex', gap: 16, fontSize: 12, flexWrap: 'wrap' }}>
         <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 4, background: '#dc2626', marginRight: 6 }} />SOS ({sosList.filter(s => s.status === 'searching').length})</span>
         <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 4, background: '#f59e0b', marginRight: 6 }} />Routed ({sosList.filter(s => s.status === 'routed').length})</span>
+        <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 4, background: '#22c55e', marginRight: 6 }} />Vehicles ({dispatches.length})</span>
+        <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 4, background: '#f97316', marginRight: 6 }} />Issues ({issues.length})</span>
       </div>
       {/* Location filter chips */}
       <div style={{ position: 'absolute', bottom: 16, left: 16, background: 'rgba(13,13,20,0.9)', backdropFilter: 'blur(10px)', border: '1px solid var(--border-color)', borderRadius: 12, padding: '8px 12px', zIndex: 1000, display: 'flex', gap: 8, fontSize: 11 }}>
+        <button
+          onClick={() => setShowIssues(prev => !prev)}
+          style={{
+            padding: '4px 10px', borderRadius: 16, border: `1px solid ${showIssues ? '#f97316' : '#333'}`,
+            background: showIssues ? '#f9731622' : 'transparent',
+            color: showIssues ? '#f97316' : '#888',
+            cursor: 'pointer', fontWeight: 600, fontSize: 10,
+          }}
+        >
+          ⚠ Issues ({issues.length})
+        </button>
         {Object.entries(LOCATION_LABELS).map(([type, label]) => (
           <button
             key={type}
@@ -284,13 +481,14 @@ function AdminMeshMap() {
   );
 }
 
+
 export default function AdminLayout() {
   return (
     <div style={{ height: '100vh', width: '100vw', background: 'var(--bg-color)', overflowY: 'auto', paddingTop: 60 }}>
       <Routes>
         <Route path="/" element={<AdminOverview />} />
         <Route path="/mesh-map" element={<div style={{ height: 'calc(100vh - 60px)' }}><AdminMeshMap /></div>} />
-        <Route path="/live-sos" element={<LiveSos />} />
+
         <Route path="/announcements" element={<AdminAnnouncements />} />
         <Route path="/volunteers" element={<AdminVolunteers />} />
         <Route path="/teams" element={<AdminTeams />} />

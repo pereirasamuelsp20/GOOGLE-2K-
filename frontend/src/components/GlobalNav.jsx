@@ -60,7 +60,7 @@ export default function GlobalNav() {
     { path: '/admin', label: 'Overview', icon: LayoutDashboard },
     { path: '/admin/users', label: 'User Management', icon: Users },
     { path: '/admin/mesh-map', label: 'Mesh Map', icon: Map },
-    { path: '/admin/live-sos', label: 'Live SOS', icon: Radio },
+
     { path: '/admin/announcements', label: 'Announcements', icon: Bell },
     { path: '/admin/volunteers', label: 'Volunteers', icon: Users },
     { path: '/admin/teams', label: 'Teams', icon: Truck },

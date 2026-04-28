@@ -130,7 +130,7 @@ export default function ProfilePage() {
           {[
             { icon: User, label: 'User ID', value: isAnon ? 'Anonymous' : user?.uid?.substring(0, 20) + '...' },
             { icon: Mail, label: 'Email', value: isAnon ? 'Not available' : (profile?.email || user?.email || 'Not set') },
-            { icon: Phone, label: 'Phone', value: isAnon ? 'Not available' : (profile?.phone || 'Not set') },
+
             { icon: Shield, label: 'Account Type', value: isAnon ? 'Anonymous Session' : 'Registered Member' },
             { icon: Clock, label: 'Member Since', value: isAnon ? 'N/A' : (profile?.createdAt?.toDate ? profile.createdAt.toDate().toLocaleDateString('en-IN', { year: 'numeric', month: 'short', day: 'numeric' }) : (user?.metadata?.creationTime ? new Date(user.metadata.creationTime).toLocaleDateString('en-IN', { year: 'numeric', month: 'short', day: 'numeric' }) : 'Unknown')) },
             ...(profile?.teamId ? [{ icon: Users, label: 'Team', value: profile.teamId.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase()) }] : []),

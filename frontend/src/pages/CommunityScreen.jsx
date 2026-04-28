@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { auth, db } from '../firebase';
-import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, updateDoc, doc, getDoc } from 'firebase/firestore';
+import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, updateDoc, doc, getDoc, deleteDoc } from 'firebase/firestore';
 import { useMesh } from '../components/MeshProvider';
 import { hashSignature, verifySignature } from '../utils/crypto';
 import { rewriteAdminPost } from '../utils/ai';
-import { Plus, ShieldCheck, ShieldAlert, Navigation, AlertTriangle, MessageSquarePlus, Activity, Sparkles, X } from 'lucide-react';
+import { Plus, ShieldCheck, ShieldAlert, Navigation, AlertTriangle, MessageSquarePlus, Activity, Sparkles, X, Trash2 } from 'lucide-react';
 import localforage from 'localforage';
 
 const GLOBAL_CHANNEL = 'global_emergency';
@@ -60,6 +60,15 @@ export default function CommunityScreen() {
     await updateDoc(postRef, { reactions });
   };
 
+  const handleDeletePost = async (postId) => {
+    if (!window.confirm('Are you sure you want to delete this post?')) return;
+    try {
+      await deleteDoc(doc(db, `channels/${GLOBAL_CHANNEL}/posts`, postId));
+    } catch (e) {
+      alert('Failed to delete post: ' + e.message);
+    }
+  };
+
   return (
     <div style={{ padding: '80px 20px 20px', backgroundColor: '#0a0a0f', color: 'white', minHeight: '100vh', display: 'flex', justifyContent: 'center' }}>
 
@@ -96,8 +105,19 @@ export default function CommunityScreen() {
                     <ShieldAlert size={14} color="#ef4444" title="Invalid Signature" />
                   }
                 </div>
-                <div style={{ fontSize: 12, color: '#888' }}>
-                  {p.timestamp ? new Date(p.timestamp.toDate()).toLocaleString() : 'Just now'}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <span style={{ fontSize: 12, color: '#888' }}>
+                    {p.timestamp ? new Date(p.timestamp.toDate()).toLocaleString() : 'Just now'}
+                  </span>
+                  {currentUser && (p.adminUid === currentUser.uid || isAdmin) && (
+                    <button
+                      onClick={() => handleDeletePost(p.id)}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4, display: 'flex', alignItems: 'center' }}
+                      title="Delete post"
+                    >
+                      <Trash2 size={14} color="#666" />
+                    </button>
+                  )}
                 </div>
               </div>
 

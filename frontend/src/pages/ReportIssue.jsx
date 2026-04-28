@@ -129,6 +129,7 @@ export default function ReportIssue() {
     queryKey: ['reports'],
     queryFn: fetchReports,
     refetchOnWindowFocus: true,
+    refetchInterval: 5000, // Poll every 5s for real-time resolved removal
   });
 
   // Submit mutation
@@ -148,12 +149,28 @@ export default function ReportIssue() {
     }
   });
 
-  // Status toggle mutation
+  // Status toggle mutation with optimistic removal
   const statusMutation = useMutation({
     mutationFn: updateStatus,
-    onSuccess: () => {
+    onMutate: async ({ id, status }) => {
+      // Cancel in-flight refetches so they don't overwrite optimistic update
+      await queryClient.cancelQueries({ queryKey: ['reports'] });
+      const prev = queryClient.getQueryData(['reports']);
+      if (status === 'Resolved') {
+        // Optimistically remove from list instantly
+        queryClient.setQueryData(['reports'], (old) =>
+          (old || []).filter(r => r._id !== id)
+        );
+      }
+      return { prev };
+    },
+    onError: (_err, _vars, context) => {
+      // Rollback on error
+      if (context?.prev) queryClient.setQueryData(['reports'], context.prev);
+    },
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ['reports'] });
-    }
+    },
   });
 
   const showToast = (message, type = 'success') => {
