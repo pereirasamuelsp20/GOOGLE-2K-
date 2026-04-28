@@ -3,25 +3,20 @@ import { collection, onSnapshot, query, where, doc, setDoc, getDocs, deleteDoc, 
 import { ref, onValue, remove, set } from 'firebase/database';
 import { db, rtdb } from '../../firebase';
 import { API_BASE } from '../../apiConfig';
-import { MapContainer, TileLayer, Circle, Marker, Popup } from 'react-leaflet';
-import L from 'leaflet';
-import { Activity, Users, AlertTriangle, Shield, Truck, Trash2 } from 'lucide-react';
-
-const pulseIconRed = L.divIcon({
-  className: 'pulse-icon-container',
-  html: '<div style="width:14px;height:14px;background:#dc2626;border-radius:50%;border:2px solid white;box-shadow:0 0 0 0 rgba(220,38,38,0.7);animation:pulseRed 1.5s infinite"></div>',
-  iconSize: [24, 24], iconAnchor: [12, 12]
-});
+import { Activity, Users, AlertTriangle, Shield, Truck, Trash2, Map, Radio, Bell, Clock, ArrowRight, Wifi, Database, Server } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 
 export default function AdminOverview() {
+  const navigate = useNavigate();
   const [metrics, setMetrics] = useState({
     activeSos: 0, teamsReady: 0, pendingVolunteers: 0,
     issuesReported: 0, respondersOnline: 0, roadBlockages: 0
   });
   const [activeSosList, setActiveSosList] = useState([]);
-  const [zones, setZones] = useState([]);
+  const [recentReports, setRecentReports] = useState([]);
   const [cleaningUp, setCleaningUp] = useState(false);
   const [cleanupResult, setCleanupResult] = useState(null);
+  const [backendStatus, setBackendStatus] = useState('checking');
 
   // Admin cleanup: clear all stuck SOS + roadblocks from Firebase + MongoDB
   const handleCleanup = async () => {
@@ -98,18 +93,6 @@ export default function AdminOverview() {
   };
 
   useEffect(() => {
-    // Zones
-    const uZ = onSnapshot(collection(db, 'zones'), snap => {
-      const z = [];
-      snap.forEach(doc => {
-        const d = doc.data();
-        const now = Date.now();
-        const timeDiff = d.updatedAt?.toMillis ? (now - d.updatedAt.toMillis()) : 0;
-        const o = Math.max(0, 1 - (timeDiff / (4 * 3600 * 1000)));
-        if (o > 0) z.push({ ...d, dynamicOpacity: o, id: doc.id });
-      });
-      setZones(z);
-    });
 
     // Teams — auto-seed if empty
     const uT = onSnapshot(collection(db, 'teams'), snap => {
@@ -184,7 +167,7 @@ export default function AdminOverview() {
       setMetrics(m => ({ ...m, activeSos: active }));
     });
 
-    // Fetch reported issues from backend for metrics
+    // Fetch reported issues from backend for metrics + recent reports
     const fetchIssueMetrics = async () => {
       try {
         const res = await fetch(`${API_BASE}/reports`);
@@ -193,22 +176,61 @@ export default function AdminOverview() {
           const total = data.length;
           const roadBlocks = data.filter(r => r.calamityType === 'Road Blocked').length;
           setMetrics(m => ({ ...m, issuesReported: total, roadBlockages: roadBlocks }));
+          setRecentReports(data.slice(0, 5));
+          setBackendStatus('online');
         }
       } catch (e) {
         console.warn('Failed to fetch issue metrics:', e.message);
+        setBackendStatus('offline');
       }
     };
     fetchIssueMetrics();
     const issueInterval = setInterval(fetchIssueMetrics, 10000);
 
-    return () => { uZ(); uT(); uV(); uR(); uS(); clearInterval(issueInterval); };
+    // Health check
+    const healthCheck = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/health`);
+        if (res.ok) setBackendStatus('online');
+        else setBackendStatus('degraded');
+      } catch { setBackendStatus('offline'); }
+    };
+    healthCheck();
+
+    return () => { uT(); uV(); uR(); uS(); clearInterval(issueInterval); };
   }, []);
 
-  const getZoneColor = (type) => {
-    if (type === 'danger') return '#dc2626';
-    if (type === 'blocked') return '#f97316';
-    if (type === 'safe') return '#22c55e';
-    return '#3b82f6';
+  const ISSUE_ICONS = {
+    'Earthquakes': '🌍', 'Landslides': '🏔', 'Power Outages': '⚡', 'Fire': '🔥',
+    'Road Blocked': '🚧', 'Flash Floods': '🌊', 'Car Accident': '🚗',
+    'Building Collapse': '🏗', 'Chemical Leaks': '☣', 'Water Logging': '🌊',
+    'Gas Leak': '☣', 'Street Light Out': '💡', 'Pothole': '🕳',
+  };
+  const ISSUE_COLORS = {
+    'Earthquakes': '#f97316', 'Landslides': '#a16207', 'Power Outages': '#eab308', 'Fire': '#dc2626',
+    'Road Blocked': '#f59e0b', 'Flash Floods': '#3b82f6', 'Car Accident': '#ef4444',
+    'Building Collapse': '#78716c', 'Chemical Leaks': '#a855f7', 'Water Logging': '#0ea5e9',
+    'Gas Leak': '#a855f7', 'Street Light Out': '#eab308', 'Pothole': '#78716c',
+  };
+
+  const SOS_ICONS = { Fire: '🔥', Medical: '🏥', Security: '🛡', General: '⚠' };
+  const SOS_STATUS_COLORS = { searching: '#f59e0b', routed: '#3b82f6', responding: '#22c55e' };
+
+  const formatTimeAgo = (ts) => {
+    if (!ts) return '';
+    const mins = Math.floor((Date.now() - ts) / 60000);
+    if (mins < 1) return 'Just now';
+    if (mins < 60) return `${mins}m ago`;
+    if (mins < 1440) return `${Math.floor(mins / 60)}h ago`;
+    return `${Math.floor(mins / 1440)}d ago`;
+  };
+
+  const formatReportTime = (dateStr) => {
+    if (!dateStr) return '';
+    const d = new Date(dateStr);
+    const day = String(d.getDate()).padStart(2, '0');
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${day} ${months[d.getMonth()]}, ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
   };
 
   const metricCards = [
@@ -262,28 +284,160 @@ export default function AdminOverview() {
         )}
       </div>
 
-      <h3 style={{ marginBottom: 16 }}>Live Map</h3>
-      <div style={{ height: 400, borderRadius: 16, overflow: 'hidden', border: '1px solid var(--border-color)' }}>
-        <MapContainer center={[19.0760, 72.8777]} zoom={12} style={{ height: '100%', width: '100%' }}>
-          <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-          {zones.map((z, i) => (
-            <Circle
-              key={z.id || i}
-              center={[z.center?.lat || 0, z.center?.lng || 0]}
-              radius={z.radius || 500}
-              pathOptions={{ color: getZoneColor(z.type), fillColor: getZoneColor(z.type), fillOpacity: (z.dynamicOpacity || 0.5) * 0.4 }}
-            />
-          ))}
-          {activeSosList.map(sos => (
-            <Marker key={sos.id} position={[sos.lat || 0, sos.lng || 0]} icon={pulseIconRed}>
-              <Popup>
-                <strong>{sos.type}</strong><br />
-                Status: {sos.status}<br />
-                UID: {sos.uid?.substring(0, 10)}
-              </Popup>
-            </Marker>
-          ))}
-        </MapContainer>
+      {/* ── Quick Actions ── */}
+      <h3 style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+        <ArrowRight size={18} color="#3b82f6" /> Quick Actions
+      </h3>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12, marginBottom: 32 }}>
+        {[
+          { label: 'Open Mesh Map', icon: Map, color: '#3b82f6', path: '/admin/mesh-map' },
+          { label: 'Manage Teams', icon: Truck, color: '#22c55e', path: '/admin/teams' },
+          { label: 'View Volunteers', icon: Users, color: '#f59e0b', path: '/admin/volunteers' },
+          { label: 'Announcements', icon: Bell, color: '#a855f7', path: '/admin/announcements' },
+          { label: 'User Management', icon: Shield, color: '#dc2626', path: '/admin/users' },
+        ].map(action => (
+          <button
+            key={action.label}
+            onClick={() => navigate(action.path)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 12,
+              background: 'var(--card-bg)', border: '1px solid var(--border-color)',
+              borderRadius: 14, padding: '16px 20px', cursor: 'pointer',
+              color: '#e0e0e0', fontSize: 14, fontWeight: 600,
+              transition: 'all 0.2s', textAlign: 'left',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.borderColor = action.color + '60'; e.currentTarget.style.background = action.color + '08'; }}
+            onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border-color)'; e.currentTarget.style.background = 'var(--card-bg)'; }}
+          >
+            <div style={{ width: 40, height: 40, borderRadius: 10, background: action.color + '15', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+              <action.icon size={20} style={{ color: action.color }} />
+            </div>
+            {action.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Two-Column: Activity Feed + System Health ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+
+        {/* ── Recent Activity Feed ── */}
+        <div style={{ background: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: 16, padding: 24 }}>
+          <h3 style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8, fontSize: 16 }}>
+            <Radio size={16} color="#dc2626" /> Live Activity
+            <span style={{ marginLeft: 'auto', width: 8, height: 8, borderRadius: 4, background: '#22c55e', animation: 'pulseRed 2s infinite' }} />
+          </h3>
+
+          {/* Active SOS */}
+          {activeSosList.length > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
+              {activeSosList.slice(0, 5).map(sos => (
+                <div key={sos.id} style={{
+                  display: 'flex', alignItems: 'center', gap: 12,
+                  padding: '12px 14px', borderRadius: 12,
+                  background: 'rgba(220,38,38,0.04)', borderLeft: `3px solid ${SOS_STATUS_COLORS[sos.status] || '#dc2626'}`,
+                }}>
+                  <span style={{ fontSize: 20 }}>{SOS_ICONS[sos.type] || '⚠'}</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 700, fontSize: 14 }}>{sos.type} Emergency</div>
+                    <div style={{ color: '#888', fontSize: 11 }}>
+                      {sos.lat?.toFixed(3)}, {sos.lng?.toFixed(3)} · {sos.displayName || 'Anonymous'}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ color: '#888', fontSize: 10 }}>{formatTimeAgo(sos.timestamp)}</div>
+                    <div style={{
+                      color: SOS_STATUS_COLORS[sos.status] || '#888', fontSize: 10,
+                      fontWeight: 700, textTransform: 'uppercase', marginTop: 2
+                    }}>{sos.status}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ padding: '20px 0', textAlign: 'center', color: '#555', fontSize: 13 }}>
+              <Activity size={24} style={{ marginBottom: 8, opacity: 0.4 }} /><br />
+              No active SOS alerts
+            </div>
+          )}
+
+          {/* Recent Reports */}
+          {recentReports.length > 0 && (
+            <>
+              <div style={{ color: '#666', fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 10, textTransform: 'uppercase' }}>Recent Reports</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {recentReports.map(r => (
+                  <div key={r._id} style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '10px 12px', borderRadius: 10,
+                    background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)',
+                  }}>
+                    <span style={{ fontSize: 16 }}>{ISSUE_ICONS[r.calamityType] || '⚠'}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 13, color: ISSUE_COLORS[r.calamityType] || '#f59e0b' }}>{r.calamityType}</div>
+                      <div style={{ color: '#666', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.locationAddress}</div>
+                    </div>
+                    <span style={{ color: '#555', fontSize: 10, flexShrink: 0 }}>{formatReportTime(r.createdAt)}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* ── System Health ── */}
+        <div style={{ background: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: 16, padding: 24 }}>
+          <h3 style={{ marginBottom: 20, display: 'flex', alignItems: 'center', gap: 8, fontSize: 16 }}>
+            <Server size={16} color="#22c55e" /> System Health
+          </h3>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {/* Backend API */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}>
+              <Wifi size={18} color={backendStatus === 'online' ? '#22c55e' : backendStatus === 'degraded' ? '#f59e0b' : '#dc2626'} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>Backend API</div>
+                <div style={{ color: '#666', fontSize: 11 }}>Express + MongoDB</div>
+              </div>
+              <span style={{
+                padding: '4px 12px', borderRadius: 8, fontSize: 10, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase',
+                background: backendStatus === 'online' ? 'rgba(34,197,94,0.1)' : backendStatus === 'degraded' ? 'rgba(245,158,11,0.1)' : 'rgba(220,38,38,0.1)',
+                color: backendStatus === 'online' ? '#22c55e' : backendStatus === 'degraded' ? '#f59e0b' : '#dc2626',
+              }}>
+                {backendStatus === 'checking' ? '...' : backendStatus}
+              </span>
+            </div>
+
+            {/* Firebase */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}>
+              <Database size={18} color="#f59e0b" />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>Firebase</div>
+                <div style={{ color: '#666', fontSize: 11 }}>Firestore + Realtime DB</div>
+              </div>
+              <span style={{ padding: '4px 12px', borderRadius: 8, fontSize: 10, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', background: 'rgba(34,197,94,0.1)', color: '#22c55e' }}>Online</span>
+            </div>
+
+            {/* Active Resources */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}>
+              <Activity size={18} color="#3b82f6" />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>Active Resources</div>
+                <div style={{ color: '#666', fontSize: 11 }}>{metrics.respondersOnline} responders · {metrics.teamsReady} teams ready</div>
+              </div>
+              <span style={{ padding: '4px 12px', borderRadius: 8, fontSize: 10, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', background: 'rgba(59,130,246,0.1)', color: '#3b82f6' }}>{metrics.respondersOnline + metrics.teamsReady} total</span>
+            </div>
+
+            {/* Pending Items */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}>
+              <Clock size={18} color="#a855f7" />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>Pending Items</div>
+                <div style={{ color: '#666', fontSize: 11 }}>{metrics.pendingVolunteers} volunteers · {metrics.issuesReported} reports</div>
+              </div>
+              <span style={{ padding: '4px 12px', borderRadius: 8, fontSize: 10, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', background: 'rgba(168,85,247,0.1)', color: '#a855f7' }}>{metrics.pendingVolunteers + metrics.issuesReported} total</span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );

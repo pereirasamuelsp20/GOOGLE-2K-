@@ -36,16 +36,34 @@ app.get(/^\/(?!api).*/, (_req, res) => {
   res.sendFile(path.join(frontendDist, 'index.html'));
 });
 
-// Connect to MongoDB then start server
-mongoose.connect(MONGO_URI)
-  .then(() => {
-    console.log('✅ Connected to MongoDB:', MONGO_URI);
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 Backend server running on http://0.0.0.0:${PORT}`);
-      console.log(`📱 Mobile devices: connect to http://<your-ip>:${PORT}`);
-    });
-  })
-  .catch(err => {
-    console.error('❌ MongoDB connection error:', err.message);
-    process.exit(1);
+// Connect to MongoDB then start server (with automatic local fallback)
+const LOCAL_MONGO = 'mongodb://127.0.0.1:27017/sos_reports';
+
+async function connectDB() {
+  try {
+    await mongoose.connect(MONGO_URI);
+    console.log('✅ Connected to MongoDB:', MONGO_URI.includes('mongodb+srv') ? 'Atlas (cloud)' : 'Local');
+  } catch (err) {
+    console.warn('⚠️  Primary MongoDB failed:', err.message);
+    if (MONGO_URI !== LOCAL_MONGO) {
+      console.log('🔄 Falling back to local MongoDB...');
+      try {
+        await mongoose.connect(LOCAL_MONGO);
+        console.log('✅ Connected to local MongoDB fallback');
+      } catch (err2) {
+        console.error('❌ All MongoDB connections failed:', err2.message);
+        process.exit(1);
+      }
+    } else {
+      console.error('❌ MongoDB connection failed:', err.message);
+      process.exit(1);
+    }
+  }
+}
+
+connectDB().then(() => {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Backend server running on http://0.0.0.0:${PORT}`);
+    console.log(`📱 Mobile devices: connect to http://<your-ip>:${PORT}`);
   });
+});

@@ -1,20 +1,26 @@
 import React, { useEffect, useState } from 'react';
 import { MapContainer, TileLayer, Circle, CircleMarker, Popup } from 'react-leaflet';
-import { collection, onSnapshot, query, where } from 'firebase/firestore';
-import { db } from '../firebase';
+import { collection, onSnapshot } from 'firebase/firestore';
+import { ref, onValue } from 'firebase/database';
+import { db, rtdb } from '../firebase';
 
 export default function MapPanel() {
   const [sosList, setSosList] = useState([]);
   const [reports, setReports] = useState([]);
 
+  // SOS via RTDB for instant sync with mobile app
   useEffect(() => {
-    const q = query(collection(db, 'sos'), where('status', 'in', ['searching', 'routed']));
-    const unsub = onSnapshot(q, (snapshot) => {
+    const unsub = onValue(ref(rtdb, 'sos'), snap => {
+      const raw = snap.val();
       const data = [];
-      snapshot.forEach(doc => {
-        const d = doc.data();
-        if (d.lat && d.lng) data.push({ id: doc.id, ...d });
-      });
+      if (raw) {
+        Object.keys(raw).forEach(k => {
+          const s = raw[k];
+          if ((s.status === 'searching' || s.status === 'routed') && s.lat && s.lng) {
+            data.push({ id: k, ...s });
+          }
+        });
+      }
       setSosList(data);
     });
     return () => unsub();

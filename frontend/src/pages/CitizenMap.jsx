@@ -1,7 +1,8 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { MapContainer, TileLayer, Circle, Polyline, Marker, Popup, useMapEvents } from 'react-leaflet';
 import { collection, onSnapshot, addDoc, serverTimestamp, query, orderBy, limit, doc, setDoc } from 'firebase/firestore';
-import { db, auth } from '../firebase';
+import { ref, set, update as rtdbUpdate, remove } from 'firebase/database';
+import { db, auth, rtdb } from '../firebase';
 import { ORS_API_KEY } from '../config';
 import { Navigation, AlertTriangle, Shield, Flame, Activity as ActivitySquare, ChevronRight, Target } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
@@ -218,7 +219,7 @@ export default function CitizenMap() {
   const { data: apiReports = [] } = useQuery({
     queryKey: ['reports'],
     queryFn: fetchApiReports,
-    refetchInterval: 30000, // poll every 30s
+    refetchInterval: 10000, // poll every 10s for near-real-time sync
     refetchOnWindowFocus: true,
   });
 
@@ -352,16 +353,23 @@ export default function CitizenMap() {
     setShowSosOptions(false);
     const ts = Date.now().toString();
     const uid = auth.currentUser?.uid || 'anon';
+    const isAnon = !auth.currentUser || auth.currentUser.isAnonymous;
 
     const payload = {
       uid, type,
       lat: userLoc[0], lng: userLoc[1],
       status: 'searching',
-      message: '', timestamp: Date.now()
+      message: '', timestamp: Date.now(),
+      displayName: isAnon ? 'Anonymous' : (auth.currentUser?.displayName || auth.currentUser?.email?.split('@')[0] || 'Web User'),
+      email: isAnon ? null : (auth.currentUser?.email || null),
+      isAnonymous: isAnon,
+      source: 'web',
     };
 
     try {
       await setDoc(doc(db, 'sos', ts), payload);
+      // Dual-write to RTDB so mobile admin screens see it instantly
+      try { await set(ref(rtdb, 'sos/' + ts), payload); } catch(e) { console.warn('RTDB SOS write failed:', e.message); }
     } catch (e) { console.warn('SOS write failed:', e.message); }
     setActiveSosId(ts);
     setActiveSosStatus('searching');
@@ -418,19 +426,30 @@ export default function CitizenMap() {
     } catch (e) {}
     if (!routeCoords.length) routeCoords = [[facility.lat, facility.lng], userLoc];
 
-    const routedDelay = Math.floor(Math.random() * 20000) + 10000;
+    // Match mobile app timings: 3-8s routed, 5-15s responding
+    const routedDelay = Math.floor(Math.random() * 5000) + 3000;
     const t1 = setTimeout(async () => {
       try { await setDoc(doc(db, 'sos', sosId), { status: 'routed' }, { merge: true }); } catch (e) {}
+      // Mirror to RTDB for instant admin sync
+      try { await rtdbUpdate(ref(rtdb, 'sos/' + sosId), { status: 'routed' }); } catch(e) {}
       setActiveSosStatus('routed');
-      setDispatchData({
-        route: routeCoords, vehiclePos: routeCoords[0],
-        facilityName: facility.name, vehicleIcon,
-        eta: Math.ceil(totalDuration / 60) + ' min', progress: 0,
-      });
 
-      const respondDelay = Math.floor(Math.random() * 30000) + 30000;
+      const dispatchPayload = {
+        route: routeCoords, vehiclePos: { lat: routeCoords[0][0], lng: routeCoords[0][1] },
+        facilityName: facility.name, facilityType: facility.type || SOS_FACILITY_MAP[sosType] || 'police',
+        facilityLat: facility.lat, facilityLng: facility.lng,
+        vehicleIcon,
+        eta: Math.ceil(totalDuration / 60) + ' min', progress: 0,
+        sosId, sosType, timestamp: Date.now(),
+      };
+      setDispatchData(dispatchPayload);
+      // Write dispatch data to RTDB so admin can track vehicles
+      try { await set(ref(rtdb, 'dispatch/' + sosId), dispatchPayload); } catch(e) {}
+
+      const respondDelay = Math.floor(Math.random() * 10000) + 5000;
       const t2 = setTimeout(async () => {
         try { await setDoc(doc(db, 'sos', sosId), { status: 'responding' }, { merge: true }); } catch (e) {}
+        try { await rtdbUpdate(ref(rtdb, 'sos/' + sosId), { status: 'responding' }); } catch(e) {}
         setActiveSosStatus('responding');
 
         const trafficMultiplier = 1 + (Math.random() * 0.1 + 0.1);
@@ -447,12 +466,16 @@ export default function CitizenMap() {
             eta: etaMin > 0 ? etaMin + ' min' : 'Arriving',
             progress,
           } : null);
+          // Update vehicle position in RTDB for admin tracking
+          try { rtdbUpdate(ref(rtdb, 'dispatch/' + sosId), { vehiclePos: { lat: routeCoords[idx][0], lng: routeCoords[idx][1] }, eta: etaMin > 0 ? etaMin + ' min' : 'Arriving', progress }); } catch(e) {}
           if (progress >= 1) {
             clearInterval(vehicleIntervalRef.current);
             vehicleIntervalRef.current = null;
-            setTimeout(() => {
+            setTimeout(async () => {
               alert(`🚨 ${facility.name} responder has arrived!`);
-              try { setDoc(doc(db, 'sos', sosId), { status: 'arrived' }, { merge: true }); } catch (e) {}
+              try { await setDoc(doc(db, 'sos', sosId), { status: 'arrived' }, { merge: true }); } catch (e) {}
+              try { await rtdbUpdate(ref(rtdb, 'sos/' + sosId), { status: 'arrived' }); } catch(e) {}
+              try { await remove(ref(rtdb, 'dispatch/' + sosId)); } catch(e) {}
               setActiveSosId(null); setActiveSosStatus(null); clearWebDispatch();
             }, 2000);
           }
@@ -466,6 +489,10 @@ export default function CitizenMap() {
   const cancelSOS = async () => {
     if (activeSosId) {
       await setDoc(doc(db, 'sos', activeSosId), { status: 'cancelled' }, { merge: true });
+      // Mirror cancel to RTDB
+      try { await rtdbUpdate(ref(rtdb, 'sos/' + activeSosId), { status: 'cancelled' }); } catch(e) {}
+      // Clean up dispatch tracking from RTDB
+      try { await remove(ref(rtdb, 'dispatch/' + activeSosId)); } catch(e) {}
       setActiveSosStatus(null);
       setActiveSosId(null);
       clearWebDispatch();

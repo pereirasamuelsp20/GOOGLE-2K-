@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { collection, onSnapshot, query, where, orderBy, limit } from 'firebase/firestore';
-import { db } from '../firebase';
+import { collection, onSnapshot, query, where } from 'firebase/firestore';
+import { ref, onValue } from 'firebase/database';
+import { db, rtdb } from '../firebase';
 import { AlertCircle, Activity, Crosshair, Users } from 'lucide-react';
 
 export default function RightPanel({ onAssignClick }) {
@@ -10,28 +11,37 @@ export default function RightPanel({ onAssignClick }) {
   const [recentSos, setRecentSos] = useState([]);
 
   useEffect(() => {
-    // 1. Active SOS Counter
-    const q1 = query(collection(db, 'sos'), where('status', 'in', ['searching', 'routed']));
-    const u1 = onSnapshot(q1, snap => setActiveSosCount(snap.size));
+    // 1 & 4. SOS data via RTDB for instant sync with mobile app
+    const uS = onValue(ref(rtdb, 'sos'), snap => {
+      const data = snap.val();
+      let active = 0;
+      const recent = [];
+      if (data) {
+        Object.keys(data).forEach(k => {
+          const s = data[k];
+          if (s.status === 'searching' || s.status === 'routed') {
+            active++;
+          }
+          if (s.status === 'searching') {
+            recent.push({ id: k, ...s });
+          }
+        });
+      }
+      setActiveSosCount(active);
+      recent.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      setRecentSos(recent.slice(0, 10));
+    });
 
-    // 2. Unassigned Responders
+    // 2. Unassigned Responders (Firestore — no RTDB equivalent)
     const q2 = query(collection(db, 'responders'), where('available', '==', true));
     const u2 = onSnapshot(q2, snap => setUnassignedResponders(snap.size));
 
-    // 3. Critical Zones (confidence > 0.5)
+    // 3. Critical Zones (Firestore)
     const q3 = query(collection(db, 'zones'), where('confidence', '>=', 0.5));
     const u3 = onSnapshot(q3, snap => setCriticalZones(snap.size));
 
-    // 4. Recent 10 unacknowledged SOS
-    const q4 = query(collection(db, 'sos'), where('status', '==', 'searching'), orderBy('timestamp', 'desc'), limit(10));
-    const u4 = onSnapshot(q4, snap => {
-      const list = [];
-      snap.forEach(doc => list.push({ id: doc.id, ...doc.data() }));
-      setRecentSos(list);
-    });
-
     return () => {
-      u1(); u2(); u3(); u4();
+      uS(); u2(); u3();
     };
   }, []);
 
